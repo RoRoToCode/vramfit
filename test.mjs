@@ -27,7 +27,7 @@ import {
   kvBytes, kvLayers, attentionInterval, shardInfo, totalWeightsBytes,
   quantFromName, quantTier, repoVerdict, analyzeTemplate, assess, inputMode,
   readGguf, vramCeiling, normalizeArgv, parseOptions, stripControl, renderRepoTable,
-  render, toJson, headlineOf, VERSION
+  render, toJson, headlineOf, VERSION, expandTargets
 } from './check.mjs'
 
 import {
@@ -820,6 +820,26 @@ test('语言别名：cn / -en / 中文 / english 都认，别的返回 null', ()
   for (const word of ['war', 'en.gguf', 'zh.txt', 'qwen', '', '  ']) {
     assert.equal(localeOf(word), null, `localeOf(${word}) 应该认不出来`)
   }
+})
+
+test('命令行参数：owner/repo 猜成 HF 仓库，不能当成相对路径', async () => {
+  // README 首屏第一行示例就是 `npx vramfit unsloth/Qwen3-8B-GGUF`。
+  // 命令行这条路径曾经漏传 guessRepo，害得示例命令直接报 ENOENT。
+  const hf = await expandTargets(['unsloth/Qwen3-8B-GGUF'], { guessRepo: true })
+  assert.deepEqual(hf.files, [], '不能当成本地文件')
+  assert.deepEqual(hf.repos, ['unsloth/Qwen3-8B-GGUF'], '要认成仓库')
+
+  // 斜杠在路径里是分隔符，不是仓库分隔符。./nope 只有一个斜杠，
+  // 光看形状很像 owner/repo，猜成仓库只会给出让人摸不着头脑的报错。
+  const rel = await expandTargets(['./nope'], { guessRepo: true })
+  assert.deepEqual(rel.repos, [], './ 开头的是路径，不是仓库')
+  assert.equal(rel.files.length, 1)
+
+  // 不给开关时一律按本地路径处理。猜仓库这件事必须是显式的，
+  // 否则「文件不存在」和「这是仓库名」两种意图会被悄悄混在一起。
+  const off = await expandTargets(['unsloth/Qwen3-8B-GGUF'], {})
+  assert.deepEqual(off.repos, [])
+  assert.deepEqual(off.files, ['unsloth/Qwen3-8B-GGUF'])
 })
 
 test('交互模式：lang en 之后提示符变 check >，lang zh 之后变回 检查 >', () => {

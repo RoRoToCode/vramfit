@@ -610,7 +610,9 @@ const dpad = (s, width, align = 'left') => {
 const spdText = (onVram) => (Number.isFinite(onVram) && onVram > 0 ? `~${onVram.toFixed(0)} tok/s` : '—')
 
 const isUrlLike = (s) => /^https?:\/\//i.test(s)
-const LOOKS_LIKE_REPO = /^[\w.-]+\/[\w.-]+$/
+// owner/repo 只有两段。排除 ./models、../x 这类相对路径写法，
+// 它们的斜杠不是仓库分隔符，猜成 HF 仓库只会给出让人摸不着头脑的报错。
+const LOOKS_LIKE_REPO = /^(?!\.)[\w.-]+\/[\w.-]+$/
 const shortName = (s) => {
   try { return stripControl(decodeURIComponent(String(s).split('/').pop() || s)) } catch { return stripControl(s) }
 }
@@ -1163,7 +1165,7 @@ async function main() {
     return
   }
 
-  const { files, repos } = await expandTargets(raw, { jsonOut })
+  const { files, repos } = await expandTargets(raw, { jsonOut, guessRepo: true })
   for (const r of repos) {
     const rows = await runRepo(r, { jsonOut, kvType, hw }) ?? []
     if (rows.length && rows.every((x) => x?.error)) process.exitCode = 1
@@ -1176,14 +1178,14 @@ async function main() {
   if (results.some((r) => r?.error)) process.exitCode = 1
 }
 
-// 纯函数的对外出口：测试用，不影响 CLI 行为
+// 对外出口：测试用，不影响 CLI 行为
 export {
   VERSION,
   quantFromName, quantRank, quantTier, repoVerdict,
   shardInfo, totalWeightsBytes, attentionInterval, kvLayers, kvBytes,
   fullLayerFraction, analyzeTemplate, assess, vramCeiling, headlineOf,
   cleanPasted, parseHfInput, stripControl, normalizeArgv, parseOptions,
-  render, renderRepoTable, toJson, limitBasisText
+  render, renderRepoTable, toJson, limitBasisText, expandTargets
 }
 
 const isMain = (() => {

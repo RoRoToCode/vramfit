@@ -402,7 +402,7 @@ Two known biases are printed in the report: sliding-window layer allocation is i
 
 ## Tests
 
-56 cases here, **no network, no GPU**:
+57 cases here, **no network, no GPU**:
 
 ```bash
 npm test        # same as: node --test test.mjs
