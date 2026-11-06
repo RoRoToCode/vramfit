@@ -401,33 +401,33 @@
 
   <div id="drop">
     <span>
-      本地模型：直接拖进来，或
+      <span id="drop-lead">本地模型：直接拖进来，或</span>
       <button class="linkbtn" type="button" id="pick">选择文件</button>
-      <span class="hint">（文件不出浏览器，只读头部几 MB）</span>
+      <span class="hint" id="drop-hint">（文件不出浏览器，只读头部几 MB）</span>
     </span>
     <button class="ghost" type="button" id="share" hidden>复制分享链接</button>
   </div>
   <input type="file" id="file" accept=".gguf" multiple hidden>
 
   <div class="examples">
-    <span>没想好查什么？</span>
-    <button type="button" class="ex" data-target="unsloth/Qwen3-8B-GGUF">看 Qwen3-8B 的全部量化</button>
+    <span id="ex-lead">没想好查什么？</span>
+    <button type="button" class="ex" id="ex-qwen" data-target="unsloth/Qwen3-8B-GGUF">看 Qwen3-8B 的全部量化</button>
   </div>
 
   <div class="hwbar">
-    <label>显卡
+    <label><span id="lbl-gpu">显卡</span>
       <select id="gpu"></select>
     </label>
     <label id="vram-wrap" hidden><span id="vram-cap">显存</span>
       <input id="vram" type="number" min="1" max="512" step="1" value="8">
     </label>
-    <label>系统内存
+    <label><span id="lbl-mem">系统内存</span>
       <input id="ram" type="number" min="4" max="1024" step="4" value="16">
     </label>
-    <label>已占用
+    <label><span id="lbl-used">已占用</span>
       <input id="used" type="number" min="0" max="128" step="0.1" value="0.8">
     </label>
-    <label>KV 精度
+    <label><span id="lbl-kv">KV 精度</span>
       <select id="kv">
         <option value="f16">f16</option>
         <option value="q8_0">q8_0</option>
@@ -443,6 +443,7 @@
   <!-- 参数与假设：内容由 core/assumptions.mjs 渲染，不在这里写死 -->
   <div id="assumptions"></div>
 
+  <!-- 独立版的介绍文字，不参与 i18n（母站复用时用自己的一段） -->
   <div class="foot" id="about">
     <p class="warn-line">
       <strong>免责：</strong>本站不加载模型、不跑推理，所有数字都是
@@ -463,7 +464,7 @@
 </main>
 
 <div id="dragmask">
-  <div class="dm-box">松开即可检查<span>.gguf · 不会上传，只读头部</span></div>
+  <div class="dm-box">松开即可检查<span id="drag-sub">.gguf · 不会上传，只读头部</span></div>
 </div>
 
 <!-- build:file-warning -->

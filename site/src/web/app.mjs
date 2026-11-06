@@ -16,16 +16,54 @@ import {
   UNIFIED_SIZES, isSoftwareRenderer
 } from './gpu.mjs'
 import { buildView, renderView, renderRepoTable, renderAssumptions } from './report.mjs'
+import { localeOf, setUiLang, tx } from './strings.mjs'
 
-// 网页版目前只有中文文案。这里显式钉住语言，否则 core 会跟着浏览器语言走：
-// 英文系统上会得到「中文界面 + 英文结论」的半成品，比全中文更差。
-// 等 report.mjs / index.html 的文案也接进词条表，再改成 navigator.language + 切换按钮。
-setLocale('zh')
+// 界面语言跟着页面走。window.__VRAMFIT_LANG 由母站注入（页面 <html lang> 也认），
+// 这样同一个 app.mjs 能被 roroto 站点和独立版共用：母站已经知道该显示什么语言，
+// 独立版就看页面自己的 lang。都没有时兜底中文。
+// core/i18n.mjs 和本文件的词条表必须同时设定，否则会出现「中文界面 + 英文结论」。
+const lang = localeOf(globalThis.__VRAMFIT_LANG || document.documentElement.lang) || 'zh'
+setLocale(lang)     // core/i18n.mjs 的，只接受 zh/en
+setUiLang(lang)     // 本文件的词条表
 
 const $ = (sel) => document.querySelector(sel)
 const esc = (s) => String(s ?? '')
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+
+/**
+ * 把 index.html 里不会动态变化的文案换成当前语言。
+ *
+ * 只处理「页面一打开就固定」的那几句。按钮在忙碌时、容量标题在切换显卡时还会
+ * 再变，那些由 setBusy / updateVramVisibility 各自负责，这里只负责初始形态。
+ * #about 那段介绍不参与 i18n（见 index.html 里的注释）。
+ */
+function localizeStatic() {
+  const setText = (sel, text) => {
+    const el = $(sel)
+    if (el) el.textContent = text
+  }
+
+  $('#target').placeholder = tx('form.ph')
+  setText('#go', tx('form.go'))
+  setText('#drop-lead', tx('drop.local'))
+  setText('#pick', tx('drop.pick'))
+  setText('#drop-hint', tx('drop.hint'))
+  setText('#share', tx('drop.share'))
+  setText('#ex-lead', tx('ex.lead'))
+  setText('#ex-qwen', tx('ex.qwen'))
+  setText('#lbl-gpu', tx('hw.gpu'))
+  setText('#lbl-mem', tx('hw.mem'))
+  setText('#lbl-used', tx('hw.used'))
+  setText('#lbl-kv', tx('hw.kv'))
+
+  // #dragmask 的第一行是纯文本节点（后面跟着小的说明 span），
+  // 外面再包一层会套上 .dm-box span 的小字样式，所以只能改 nodeValue。
+  const box = $('#dragmask .dm-box')
+  const lead = box && [...box.childNodes].find((n) => n.nodeType === 3 && n.nodeValue.trim())
+  if (lead) lead.nodeValue = tx('drag.drop')
+  setText('#drag-sub', tx('drag.sub'))
+}
 
 const state = {
   gpu: null,        // 当前选中的显卡条目
@@ -40,7 +78,7 @@ const state = {
 function initGpuSelect() {
   const sel = $('#gpu')
   const groups = gpuOptions()
-  sel.innerHTML = '<option value="">没认出来 / 选一下你的卡</option>' +
+  sel.innerHTML = `<option value="">${tx('gpu.none')}</option>` +
     groups.map((g) => `<optgroup label="${esc(g.label)}">${
       g.items.map((it) => `<option value="${esc(it.name)}" data-vram="${it.vram}" data-bw="${it.bw}" data-unified="${it.unified ? 1 : 0}">${esc(it.name)}</option>`).join('')
     }</optgroup>`).join('')
@@ -56,14 +94,14 @@ function initGpuSelect() {
     const opt = [...sel.options].find((o) => o.value === hit.name)
     if (opt) sel.value = hit.name
     $('#vram').value = hit.vram || ''
-    $('#detect-note').textContent = `浏览器报的是 ${hit.name}`
+    $('#detect-note').textContent = tx('gpu.detected', { name: hit.name })
   } else if (!renderer) {
-    $('#detect-note').textContent = '浏览器没给出显卡信息，请在左边手动选'
+    $('#detect-note').textContent = tx('gpu.noinfo')
   } else if (isSoftwareRenderer(renderer)) {
     // 远程桌面、无头环境、虚拟机都会落到这里，报的是 Basic Render Driver
-    $('#detect-note').textContent = '没检测到独立显卡（当前是软件渲染），请在左边手动选'
+    $('#detect-note').textContent = tx('gpu.software')
   } else {
-    $('#detect-note').textContent = `认不出这个型号，请在左边手动选：${renderer.slice(0, 44)}`
+    $('#detect-note').textContent = tx('gpu.unknown', { renderer: renderer.slice(0, 44) })
   }
   updateVramVisibility()
 }
@@ -80,12 +118,10 @@ function updateVramVisibility() {
   // #vram 是 <input type=number>。之前 Apple 统一内存分支往它里面写 <option>，
   // 而 input 没有子节点，innerHTML 直接被丢弃 —— 容量框永远空白，最后
   // buildHardware 拿到 0，静默退化成「CPU 推理」。改成只设 value 和取值范围。
-  $('#vram-cap').textContent = unified ? '统一内存' : '显存'
+  $('#vram-cap').textContent = unified ? tx('hw.cap.unified') : tx('hw.cap.vram')
   input.min = unified ? '8' : '1'
   input.step = unified ? '8' : '1'
-  input.title = unified
-    ? 'Apple Silicon 的统一内存就是买机器时选的内存容量，浏览器读不到，请按实际填'
-    : '显卡显存容量，单位 GB；不确定就查一下型号'
+  input.title = unified ? tx('hint.unified') : tx('hint.vram')
   if (unified) input.setAttribute('list', 'vram-sizes')
   else input.removeAttribute('list')
 
@@ -129,7 +165,7 @@ function currentHardware() {
 }
 
 function hwLabel() {
-  if (!state.gpu) return 'CPU 推理'
+  if (!state.gpu) return tx('hw.cpuOnly')
   const v = $('#vram').value
   return v ? `${state.gpu.name} · ${v} GB` : state.gpu.name
 }
@@ -146,7 +182,7 @@ function setStatus(html, kind = '') {
 function setBusy(on) {
   state.busy = on
   $('#go').disabled = on
-  $('#go').textContent = on ? '检查中…' : '检查'
+  $('#go').textContent = on ? tx('form.goBusy') : tx('form.go')
 }
 
 /**
@@ -158,18 +194,24 @@ function setBusy(on) {
 function failHtml(e) {
   const msg = String(e?.message ?? e)
   const tips = []
-  if (/网络连不上|Failed to fetch|Load failed|请求超时/i.test(msg)) {
-    tips.push('确认能打开 hf-mirror.com。浏览器里开了代理一般没问题，公司网络或广告拦截插件可能拦住请求。')
-    tips.push('已经把 .gguf 下载到本地的，直接拖进来 —— 本地文件完全不经过网络。')
+  // 这些正则匹配的是「错误消息内容」，不是界面文案。消息来源有两边：
+  //   - core/ 按 core 的 locale 抛，中文界面给中文、英文界面给英文；
+  //   - net/hf.mjs 的网络错误目前只有中文（本工具没给 net 做翻译）。
+  // 所以中英关键词都得列上，否则英文界面下永远匹配不到，tip 就一条都不给。
+  if (/网络连不上|Failed to fetch|Load failed|请求超时|fetch failed|network|timeout|aborted/i.test(msg)) {
+    tips.push(tx('app.tip.net'))
+    tips.push(tx('app.tip.local'))
   }
-  if (/不支持 Range/i.test(msg)) {
-    tips.push('这个地址只会整份下载。换成 hf-mirror 的直链，或者先下载到本地再拖进来。')
+  // 「不支持 Range」这句本身就含 Range，所以一条 \bRange\b 就能同时命中中英。
+  if (/\bRange\b/i.test(msg)) {
+    tips.push(tx('app.tip.range'))
   }
-  if (/没有可独立运行的|没有 \.gguf/i.test(msg)) {
-    tips.push('换个仓库，或者直接贴具体那个 .gguf 文件页面的地址。')
+  // 中文这条由本文件和 net 抛，英文只由本文件的 tx 抛；两边关键词都要在。
+  if (/没有可独立运行的|没有 \.gguf|no standalone|no \.gguf/i.test(msg)) {
+    tips.push(tx('app.tip.pickFile'))
   }
   const tip = tips.length ? `<div class="status-tip">${tips.map((t) => esc(t)).join('<br>')}</div>` : ''
-  return `<strong>没查成</strong><br>${esc(msg)}${tip}`
+  return `<strong>${tx('app.err.title')}</strong><br>${esc(msg)}${tip}`
 }
 
 // ───────────────────────── 主流程 ─────────────────────────
@@ -182,7 +224,7 @@ async function run(rawInput, { fromUrl = false } = {}) {
   const out = $('#output')
   out.innerHTML = ''
   setBusy(true)
-  setStatus('正在识别输入…')
+  setStatus(tx('app.st.parse'))
 
   try {
     const parsed = parseHfInput(raw)
@@ -206,7 +248,7 @@ async function run(rawInput, { fromUrl = false } = {}) {
       return
     }
 
-    throw new Error('没认出这是链接还是文件。贴 HuggingFace 的模型页地址，或者把 .gguf 拖进来')
+    throw new Error(tx('app.err.notInput'))
   } catch (e) {
     setStatus(failHtml(e), 'bad')
   } finally {
@@ -215,7 +257,7 @@ async function run(rawInput, { fromUrl = false } = {}) {
 }
 
 async function runFile(url, hw) {
-  setStatus('只读文件头部，不下载整个模型…')
+  setStatus(tx('app.st.header'))
   const meta = await fetchGguf(url)
   const result = assess(meta, hw, {
     kvType: state.kvType,
@@ -228,9 +270,9 @@ async function runFile(url, hw) {
 }
 
 async function runRepo(repo, hw) {
-  setStatus(`正在取 ${esc(repo)} 的文件列表…`)
+  setStatus(tx('app.st.list', { repo: esc(repo) }))
   const list = await listRepoGgufs(repo)
-  if (!list.urls.length) throw new Error('这个仓库里没有可独立运行的 .gguf')
+  if (!list.urls.length) throw new Error(tx('app.err.noGgufInRepo'))
 
   const rows = []
   const total = list.urls.length
@@ -253,7 +295,7 @@ async function runRepo(repo, hw) {
         rows.push({ error: e.message, file: url, url })
       }
       done++
-      setStatus(`读取中 ${done}/${total}…`)
+      setStatus(tx('app.st.reading', { done, total }))
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, total) }, worker))
@@ -277,10 +319,10 @@ async function runLocalFiles(files) {
   try {
     const hw = currentHardware()
     const ggufs = [...files].filter((f) => /\.gguf$/i.test(f.name))
-    if (!ggufs.length) throw new Error('这些文件里没有 .gguf')
+    if (!ggufs.length) throw new Error(tx('app.err.noGgufInFiles'))
 
     const first = ggufs.find((f) => isFirstShard(f.name)) ?? ggufs[0]
-    setStatus(`读取 ${esc(first.name)}…`)
+    setStatus(tx('app.st.readOne', { name: esc(first.name) }))
     const meta = await readLocalGguf(first)
     const result = assess(meta, hw, {
       kvType: state.kvType,
@@ -288,7 +330,7 @@ async function runLocalFiles(files) {
     })
     const view = buildView(meta, result, { kvType: state.kvType })
     $('#output').innerHTML = renderView(view)
-    setStatus(ggufs.length > 1 ? `共收到 ${ggufs.length} 个文件，只查了第一个（分片模型只认第一片）` : '')
+    setStatus(ggufs.length > 1 ? tx('app.st.firstOnly', { n: ggufs.length }) : '')
     syncUrl({ gpu: state.gpu?.name, vram: $('#vram').value || '', kv: state.kvType })
   } catch (e) {
     setStatus(failHtml(e), 'bad')
@@ -309,10 +351,10 @@ function syncUrl(params) {
   btn.onclick = async () => {
     try {
       await navigator.clipboard.writeText(u.toString())
-      btn.textContent = '已复制'
-      setTimeout(() => { btn.textContent = '复制分享链接' }, 1600)
+      btn.textContent = tx('drop.shared')
+      setTimeout(() => { btn.textContent = tx('drop.share') }, 1600)
     } catch {
-      setStatus('复制失败，可以手动复制地址栏')
+      setStatus(tx('drop.shareFail'))
     }
   }
 }
@@ -345,6 +387,7 @@ function restoreFromUrl() {
 // ───────────────────────── 初始化 ─────────────────────────
 
 function init() {
+  localizeStatic()
   initGpuSelect()
 
   // Apple 统一内存的常见档位，做成输入框的候选列表（不强制）

@@ -15,6 +15,8 @@
  * RTX 4060。所以识别结果必须可改，且要明说「这是浏览器报的」。
  */
 
+import { tx } from './strings.mjs'
+
 /**
  * 带宽单位 GB/s；vram 单位 GB（0 表示由用户填，Apple 和核显属于这类）
  *
@@ -110,11 +112,17 @@ const GPU_TABLE = [
   { re: /m1/i, name: 'Apple M1', vram: 0, bw: 68, vendor: 'apple', unified: true },
 ]
 
-/** 核显：共用系统内存，没有独立带宽优势 */
+/**
+ * 核显：共用系统内存，没有独立带宽优势
+ *
+ * 名字放进词条表，但这里只存 key：模块加载时还不一定知道界面语言（app.mjs 在
+ * import 之后才读页面 lang），必须在 matchGpu() 调用时再取。正则匹配的是浏览器
+ * 给的渲染器字符串，跟这些 label 无关，改文案不会影响识别。
+ */
 const INTEGRATED = [
-  { re: /arc\s*(?:\(tm\)\s*)?(?:a|b)?\d{3}/i, name: 'Intel Arc 核显', vendor: 'intel', integrated: true },
-  { re: /iris\s*xe|uhd\s*graphics|hd\s*graphics/i, name: 'Intel 核显', vendor: 'intel', integrated: true },
-  { re: /radeon\s*(?:\(tm\)\s*)?\d{3}m|vega\s*\d+/i, name: 'AMD 核显', vendor: 'amd', integrated: true },
+  { re: /arc\s*(?:\(tm\)\s*)?(?:a|b)?\d{3}/i, nameKey: 'hw.igpu.arc', vendor: 'intel', integrated: true },
+  { re: /iris\s*xe|uhd\s*graphics|hd\s*graphics/i, nameKey: 'hw.igpu.intel', vendor: 'intel', integrated: true },
+  { re: /radeon\s*(?:\(tm\)\s*)?\d{3}m|vega\s*\d+/i, nameKey: 'hw.igpu.amd', vendor: 'amd', integrated: true },
 ]
 
 /** 这些渲染器名说明拿到的是软件/远程桌面后端，不是真显卡 */
@@ -125,14 +133,26 @@ export function isSoftwareRenderer(renderer) {
   return !renderer || BOGUS.test(renderer)
 }
 
-export const VENDOR_LABEL = { nvidia: 'NVIDIA', amd: 'AMD', apple: 'Apple', intel: 'Intel', other: '其它' }
+export const VENDOR_LABEL = {
+  nvidia: 'NVIDIA',
+  amd: 'AMD',
+  apple: 'Apple',
+  intel: 'Intel',
+  // 只有这一项要翻。用 getter 而不是普通字段：模块加载时界面语言可能还没设定。
+  get other() { return tx('hw.other') }
+}
 
 /** 从 WebGL 的渲染器字符串里认出型号。认不出返回 null。 */
 export function matchGpu(renderer) {
   const s = String(renderer ?? '')
   if (!s || BOGUS.test(s)) return null
   for (const g of GPU_TABLE) if (g.re.test(s)) return { ...g, kind: g.unified ? 'unified' : 'discrete' }
-  for (const g of INTEGRATED) if (g.re.test(s)) return { ...g, vram: 0, bw: 0, kind: 'integrated' }
+  for (const g of INTEGRATED) {
+    if (!g.re.test(s)) continue
+    // 名字按当前界面语言取，不能把 key 泄到下拉框和报告里
+    const { nameKey, ...rest } = g
+    return { ...rest, name: tx(nameKey), vram: 0, bw: 0, kind: 'integrated' }
+  }
   return null
 }
 

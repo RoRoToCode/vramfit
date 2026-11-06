@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { readFile, readdir } from 'node:fs/promises'
 
-import { assess, ASSUMPTIONS } from '../core/index.mjs'
+import { assess, assumptionsList } from '../core/index.mjs'
 import { buildHtml, writeSite, DIST, MODULES, sourcePath } from './build.mjs'
 
 // 网页模块 import 的是 '../core/index.mjs'（core 就在仓库根），
@@ -192,7 +192,9 @@ test('显卡识别：Apple 统一内存按用户填的容量算', () => {
 
 test('参数与假设：面板分组齐全、内容已转义', () => {
   const html = renderAssumptions()
-  for (const g of ASSUMPTIONS) {
+  // 用 assumptionsList() 而不是原始 ASSUMPTIONS：后者是 [中文, English] 数组，
+  // includes() 会把它当成 "中文,English" 去匹配，正好把这个 bug 盖住了。
+  for (const g of assumptionsList()) {
     assert.ok(html.includes(g.group), `面板里缺少「${g.group}」`)
   }
   assert.ok(html.includes('200 MiB'), '运行时开销那一条要写具体数值')
@@ -272,11 +274,14 @@ test('网页报告：模板说明不能渲染成 [object Object]', () => {
   assert.match(html, /<i class="ok">✓<\/i>/, 'tools 分支那一行应该有 ✓ 标记')
 })
 
-test('网页报告：语言被钉在中文，不受系统 locale 影响', async () => {
-  // 页面文案还没接词条表，core 却已经会跟着 locale 走。
-  // 不钉住的话，英文系统上会出现「中文界面 + 英文结论」。
+test('网页报告：语言跟着页面走，界面与结论必须同一种语言', async () => {
+  // 以前页面文案只有中文，core 却会跟着 locale 走，所以 app.mjs 把语言钉死在中文。
+  // 现在文案进了词条表，语言改由页面决定（__VRAMFIT_LANG / <html lang>，默认中文），
+  // 但 core 和界面词条表仍必须同时设定，否则英文系统上会出现「中文界面 + 英文结论」。
   const app = await readFile(new URL('./src/web/app.mjs', import.meta.url), 'utf8')
-  assert.match(app, /setLocale\('zh'\)/, 'app.mjs 必须显式固定语言')
+  assert.match(app, /localeOf\(globalThis\.__VRAMFIT_LANG \|\| document\.documentElement\.lang\)/)
+  assert.match(app, /setLocale\(lang\)/, 'core 的语言要跟着页面设定')
+  assert.match(app, /setUiLang\(lang\)/, '界面词条表也要跟着页面设定')
   assert.ok(buildView(meta, assess(meta, hw, {}), {}).verdict.title.includes('可以当')
     || buildView(meta, assess(meta, hw, {}), {}).verdict.title.includes('能跑'), '结论不是中文')
 })

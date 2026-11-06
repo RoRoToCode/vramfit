@@ -8,8 +8,11 @@
 import {
   GB, FILE_TYPE, quantFromName, paramCountOf, shardInfo, totalWeightsBytes,
   analyzeTemplate, attentionReport, stripControl, baseName, fmtSize,
-  headlineOf, TUNING, ASSUMPTIONS
+  headlineOf, TUNING, assumptionsList
 } from '../core/index.mjs'
+// 界面壳子的词条表（表单、表头、状态提示）。报告正文里的结论仍由 core/i18n.mjs
+// 按 core 的 locale 生成，两边在 app.mjs 里同时设定，不会各说一种语言。
+import { tx } from './strings.mjs'
 
 const esc = (s) => String(s ?? '')
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -52,7 +55,7 @@ function breakdown(result) {
 }
 
 export function buildView(meta, result, ctx = {}) {
-  const quant = quantFromName(meta.file) ?? (meta.fileType !== undefined ? FILE_TYPE[meta.fileType] : undefined) ?? '未知'
+  const quant = quantFromName(meta.file) ?? (meta.fileType !== undefined ? FILE_TYPE[meta.fileType] : undefined) ?? tx('rp.unknown')
   const shard = shardInfo(meta.file)
   const weights = totalWeightsBytes(meta)
   const speed = result.speed?.onVram
@@ -96,7 +99,7 @@ export function buildView(meta, result, ctx = {}) {
       ctx: r.ctx,
       ctxText: fmtCtx(r.ctx),
       need: r.need,
-      needText: r.need === null ? '算不出' : fmtGB(r.need),
+      needText: r.need === null ? tx('rp.cantEstimate') : fmtGB(r.need),
       fits: r.fits,
       tight: r.tight,
       beyondNative: r.beyondNative,
@@ -104,28 +107,40 @@ export function buildView(meta, result, ctx = {}) {
     })),
     template: { level: tpl.level, notes: tpl.notes },
     attention: att.swa
-      ? `${att.kvLayers} 层带 KV，其中 ${att.swa.fullLayers} 层全注意力、滑窗窗口 ${fmtCtx(att.swa.window)}`
+      ? tx('rp.att.swa', { n: att.kvLayers, full: att.swa.fullLayers, win: fmtCtx(att.swa.window) })
       : att.intervalInferred
-        ? `${att.kvLayers} 层带 KV（混合线性注意力，按 ${att.interval}:1 推断）`
-        : `${att.kvLayers} 层带 KV`,
-    moe: meta.expertCount ? `${meta.expertCount} 专家，每 token 激活 ${meta.expertUsedCount ?? '?'} 个` : null,
+        ? tx('rp.att.interval', { n: att.kvLayers, i: att.interval })
+        : tx('rp.att.plain', { n: att.kvLayers }),
+    moe: meta.expertCount
+      ? tx('rp.moe', { n: meta.expertCount, used: meta.expertUsedCount ?? '?' })
+      : null,
     kvType: ctx.kvType ?? 'f16'
   }
 }
 
-const LEVEL_TEXT = { strong: '支持工具调用', partial: '支持工具调用（部分）', weak: '格式不全', none: '不支持' }
+/**
+ * 工具调用能力四档。core 的 level 是固定枚举（strong / partial / weak / none），
+ * 直接拼 key；万一出现新档位，退回原始值，不要把 ⟪key⟫ 漏到页面上。
+ */
+function levelText(level) {
+  const out = tx('rp.tpl.' + level)
+  return out.startsWith('⟪') ? level : out
+}
 
 export function renderView(v) {
   const meter = Math.max(2, Math.min(100, Math.round(v.ratio * 100)))
   // CPU 推理时 onVram 是 null，只算过 onRam；以前这里只看 onVram，
   // 于是没插独显的机器上一律显示「带宽未知，不给估计」，而 CPU 速度其实算得出来。
+  const noSpeed = tx('rp.speed.unknown')
   const speedText = v.onCpu
-    ? (v.speedOnCpu ? `CPU 约 ${v.speedOnCpu} tok/s` : '带宽未知，不给估计')
-    : v.speed ? `约 ${v.speed} tok/s` : '带宽未知，不给估计'
+    ? (v.speedOnCpu ? tx('rp.speed.cpu', { n: v.speedOnCpu }) : noSpeed)
+    : v.speed ? tx('rp.speed.vram', { n: v.speed }) : noSpeed
 
   const tierRows = v.tiers.map((t) => {
     const cls = t.beyondNative ? 'beyond' : t.fits ? (t.tight ? 'tight' : 'ok') : 'no'
-    const mark = t.beyondNative ? '超出原生' : t.fits ? (t.tight ? '勉强' : '够') : '不够'
+    const mark = t.beyondNative ? tx('rp.tier.beyond')
+      : t.fits ? (t.tight ? tx('rp.tier.tight') : tx('rp.tier.ok'))
+        : tx('rp.tier.no')
     return `<div class="tier ${cls}${t.best ? ' is-best' : ''}">
       <span class="t-ctx">${esc(t.ctxText)}</span>
       <span class="t-bar"><i style="width:${Math.min(100, Math.round(((t.need || 0) / (v.limit || 1)) * 100))}%"></i></span>
@@ -134,16 +149,18 @@ export function renderView(v) {
     </div>`
   }).join('')
 
+  const unknown = tx('rp.unknown')
+  const read = tx('rp.src.read')
   const infoRows = [
-    ['架构', v.arch ?? '未知', '读到'],
-    ['参数量', v.params, '读到'],
-    ['层数', v.layers ? `${v.layers} 层 · ${v.attention}` : '未知', '读到'],
-    ['原生上下文', v.native ? fmtCtx(v.native) : '未知', '读到'],
-    ['对话模板', LEVEL_TEXT[v.template.level] ?? v.template.level, '读到'],
-    ['KV 精度', v.kvType === 'f16' ? 'f16（默认）' : v.kvType, '设定']
+    [tx('rp.info.arch'), v.arch ?? unknown, read],
+    [tx('rp.info.params'), v.params, read],
+    [tx('rp.info.layers'), v.layers ? tx('rp.info.layersVal', { n: v.layers, att: v.attention }) : unknown, read],
+    [tx('rp.info.native'), v.native ? fmtCtx(v.native) : unknown, read],
+    [tx('rp.info.template'), levelText(v.template.level), read],
+    [tx('rp.info.kv'), v.kvType === 'f16' ? tx('rp.info.kvDefault') : v.kvType, tx('rp.src.set')]
   ]
-  if (v.moe) infoRows.push(['MoE', v.moe, '读到'])
-  if (v.shard) infoRows.push(['分片', `第 ${v.shard} 片，体积按整模估算`, '算出'])
+  if (v.moe) infoRows.push([tx('rp.info.moe'), v.moe, read])
+  if (v.shard) infoRows.push([tx('rp.info.shard'), tx('rp.info.shardVal', { n: v.shard }), tx('rp.src.derived')])
 
   const info = infoRows.map(([k, val, src]) =>
     `<div class="kv-row"><span class="k">${esc(k)}</span><span class="v">${esc(val)}</span><span class="src">${esc(src)}</span></div>`
@@ -160,14 +177,14 @@ export function renderView(v) {
   const budget = v.estimated
     ? `<div class="meter"><i style="width:${meter}%"></i></div>
       <div class="b-legend">
-        <span><i class="dot w"></i>权重 ${fmtGB(v.weightsBytes)}</span>
-        <span><i class="dot k"></i>KV ${v.kvBytes ? fmtGB(v.kvBytes) : '—'}</span>
-        <span><i class="dot o"></i>开销 ${fmtSize(v.overheadBytes)}</span>
+        <span><i class="dot w"></i>${tx('rp.legend.weights', { size: fmtGB(v.weightsBytes) })}</span>
+        <span><i class="dot k"></i>${tx('rp.legend.kv', { size: v.kvBytes ? fmtGB(v.kvBytes) : '—' })}</span>
+        <span><i class="dot o"></i>${tx('rp.legend.overhead', { size: fmtSize(v.overheadBytes) })}</span>
         <span class="spd">${esc(speedText)}</span>
       </div>`
-    : `<div class="b-legend"><span><i class="dot w"></i>权重 ${fmtGB(v.weightsBytes)}</span>
+    : `<div class="b-legend"><span><i class="dot w"></i>${tx('rp.legend.weights', { size: fmtGB(v.weightsBytes) })}</span>
         <span class="spd">${esc(speedText)}</span></div>
-      <p class="note">缺元数据，KV cache 无法推算，所以只有权重体积可信。</p>`
+      <p class="note">${tx('rp.note.meta')}</p>`
 
   return `<article class="card">
     <header class="verdict" data-level="${v.verdict.level}">
@@ -177,7 +194,7 @@ export function renderView(v) {
       </div>
       <div class="v-side">
         <div class="v-num">${v.bestCtx ? esc(v.bestCtxText) : '—'}</div>
-        <div class="v-cap">推荐上下文</div>
+        <div class="v-cap">${tx('rp.cap.recommended')}</div>
       </div>
     </header>
 
@@ -192,33 +209,30 @@ export function renderView(v) {
 
     <section class="budget">
       <div class="b-head">
-        <span>显存占用</span>
+        <span>${tx('rp.budget.title')}</span>
         <span class="b-num">${esc(v.totalText)} / ${esc(v.limitText)}</span>
       </div>
       ${budget}
-      ${v.onCpu ? '<p class="note">没有可用显卡，按 CPU 推理估算</p>' : ''}
+      ${v.onCpu ? `<p class="note">${tx('rp.note.onCpu')}</p>` : ''}
     </section>
 
     <section class="tiers">
-      <h3>不同上下文要多少显存</h3>
+      <h3>${tx('rp.tiers.title')}</h3>
       ${tierRows}
     </section>
 
     <section class="info">
-      <h3>模型信息</h3>
+      <h3>${tx('rp.info.title')}</h3>
       ${info}
     </section>
 
     <details class="tpl">
-      <summary>工具调用能力（${esc(LEVEL_TEXT[v.template.level] ?? v.template.level)}）</summary>
+      <summary>${esc(tx('rp.tpl.summary', { level: levelText(v.template.level) }))}</summary>
       <ul>${tplNotes}</ul>
     </details>
 
     <footer class="disclaimer">
-      <strong>以上全部是静态推算，不是实测。</strong>
-      权重按文件体积、KV 按层数×head、速度按带宽÷权重算出来的，误差通常在 ±${TUNING.speedErrorPct}% 以内，
-      但要看实际驱动和参数设置。模板里有 tools 分支也不等于模型真会调工具。
-      结论只用来排掉「根本不可能」的选项，不能当合格证 —— 请实际加载跑一次再决定。
+      ${tx('rp.disclaimer', { err: TUNING.speedErrorPct })}
     </footer>
   </article>`
 }
@@ -258,15 +272,15 @@ export function renderRepoTable(repo, rows, hwName) {
   return `<article class="card">
     <div class="head">
       <div class="h-name">${safe(repo)}</div>
-      <div class="h-meta"><span class="chip">${rows.length} 个变体</span>${hwName ? `<span class="chip ghost">${safe(hwName)}</span>` : ''}</div>
+      <div class="h-meta"><span class="chip">${tx('rp.repo.variants', { n: rows.length })}</span>${hwName ? `<span class="chip ghost">${safe(hwName)}</span>` : ''}</div>
     </div>
     <table class="repo">
-      <thead><tr><th>量化</th><th class="num">体积</th><th class="num">上下文</th><th class="num">速度</th><th class="res">结论</th></tr></thead>
+      <thead><tr><th>${tx('rp.col.quant')}</th><th class="num">${tx('rp.col.size')}</th><th class="num">${tx('rp.col.ctx')}</th><th class="num">${tx('rp.col.speed')}</th><th class="res">${tx('rp.col.verdict')}</th></tr></thead>
       <tbody>${body}</tbody>
     </table>
     <footer class="disclaimer">
-      静态推算，仅供参考；体积、上下文、速度都是估算值，下载后仍要实际加载验证。
-      ${clickable ? '点任意一行可以看这个量化的完整报告。' : ''}
+      ${tx('rp.repo.note')}
+      ${clickable ? tx('rp.repo.click') : ''}
     </footer>
   </article>`
 }
@@ -279,7 +293,9 @@ export function renderRepoTable(repo, rows, hwName) {
  * 代码算 400 MiB」这种最难查的问题。
  */
 export function renderAssumptions() {
-  const groups = ASSUMPTIONS.map((g) => `
+  // 走 assumptionsList()：它按当前 locale 把 [中文, English] 展开成一个值。
+  // 直接用 ASSUMPTIONS 拼字符串会把两个语种一起印出来（"权重体积,Weight size"）。
+  const groups = assumptionsList().map((g) => `
     <div class="asm-group">
       <h4>${esc(g.group)}</h4>
       <dl>${g.items.map((it) => `
@@ -289,19 +305,17 @@ export function renderAssumptions() {
     </div>`).join('')
 
   return `<details class="assumptions">
-    <summary>这些数字是怎么算出来的（参数与假设）</summary>
+    <summary>${tx('rp.asm.summary')}</summary>
     <p class="asm-lead">
-      本工具不加载模型、不跑推理。下面每一个数字都写死在
-      <code>core/assumptions.mjs</code> 里，报告、网页、README 显示的是同一份。
-      改动它们等于改结论，所以列出完整清单，而不是只给一句「仅供参考」。
+      ${tx('rp.asm.lead')}
     </p>
     ${groups}
     <div class="asm-group">
-      <h4>怎么读这份报告</h4>
+      <h4>${tx('rp.asm.howto')}</h4>
       <dl>
-        <dt>读到</dt><dd><b>直接从 GGUF 元数据里取出的值</b><span>架构、层数、head 数、原生上下文</span></dd>
-        <dt>算出</dt><dd><b>用上面的参数推出来的值</b><span>KV cache、显存占用、推荐上下文</span></dd>
-        <dt>设定</dt><dd><b>你在这页面上选的</b><span>显卡、显存、已占用、KV 精度</span></dd>
+        <dt>${tx('rp.asm.read.k')}</dt><dd><b>${tx('rp.asm.read.v')}</b><span>${tx('rp.asm.read.n')}</span></dd>
+        <dt>${tx('rp.asm.derived.k')}</dt><dd><b>${tx('rp.asm.derived.v')}</b><span>${tx('rp.asm.derived.n')}</span></dd>
+        <dt>${tx('rp.asm.set.k')}</dt><dd><b>${tx('rp.asm.set.v')}</b><span>${tx('rp.asm.set.n')}</span></dd>
       </dl>
     </div>
   </details>`

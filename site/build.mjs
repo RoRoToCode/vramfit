@@ -48,6 +48,8 @@ const MODULES = [
   'core/assess.mjs',
   'core/index.mjs',
   'net/hf.mjs',
+  // 界面词条表：gpu / report / app 都 import 它，必须排在它们前面
+  'web/strings.mjs',
   'web/gpu.mjs',
   'web/local.mjs',
   'web/report.mjs',
