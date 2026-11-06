@@ -120,6 +120,13 @@ npm publish
 `check.mjs` 里的 `VERSION` 是写死的（单文件 bin 不去读包元数据），改版本号要两处一起改。
 测试会对不上直接失败。
 
+## 有问题或者想法
+
+- 不确定某个方向该不该做（比如「要不要支持 safetensors」），先开个
+  [Issue](https://github.com/RoRoToCode/vramfit/issues) 聊，别先写一版再被拒。
+- 发现安全问题，发邮件到 <su@roroto.com>，不要公开开 Issue。
+- 觉得用法没说清楚，也是 Issue —— 那是文档的问题，不是你的问题。
+
 ## 许可
 
 MIT。别人拿去改、商用、嵌进自己的产品都行，唯一硬性要求是保留许可声明。

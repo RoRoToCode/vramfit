@@ -4,7 +4,7 @@
   "description": "判断一个本地大模型文件在你这台机器上跑不跑得动、能开多大上下文、能不能当 coding agent 用。命令行工具，无依赖，只读文件头部元数据。",
   "type": "module",
   "license": "MIT",
-  "author": "RoRoToCode (https://www.roroto.com)",
+  "author": "RoRoToCode <su@roroto.com> (https://www.roroto.com)",
   "homepage": "https://www.roroto.com/vramfit",
   "repository": {
     "type": "git",

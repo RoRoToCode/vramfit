@@ -585,6 +585,23 @@ PowerShell 5.1 默认按 GBK 解码，先执行 `[Console]::OutputEncoding = [Sy
 **Q：速度那一栏为什么写"~200 tok/s 以内"而不是具体数字？**
 权重小于 2 GB 时，带宽已经不是瓶颈，每 token 的 kernel launch、采样、传输这些固定开销占主导，公式会算出 400 这种不可能的数（0.6B Q4 在 RTX 3050 上公式给 395，实测 70–120）。这时只给上限，不给假精度。
 
+## 反馈与联系
+
+| 什么情况 | 去哪 |
+|---|---|
+| 算错了、崩了、某个模型识别不出来 | [GitHub Issues](https://github.com/RoRoToCode/vramfit/issues) |
+| 安全相关问题 | 邮件 <su@roroto.com>，不要开 Issue |
+| 商用、合作、转载授权 | <su@roroto.com> |
+| 想自己动手改 | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+
+优先用 Issues：公开、可搜索，下一个遇到同样问题的人能直接看到答案，不用再问一遍。
+
+提 Issue 时带上三样东西，能省掉大半来回：
+
+1. 模型名或 HuggingFace 链接
+2. 显卡型号和显存（`nvidia-smi` 看到的，或者你 `--vram` 写进去的值）
+3. `node check.mjs --about` 的输出 —— 里面是这台机器实际套用的参数
+
 ## 许可证、署名与引用
 
 **MIT。** 可以商用、可以闭源、可以改名、可以打包进你自己的产品——VS Code 插件、

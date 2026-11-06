@@ -327,6 +327,7 @@ const DICT = {
     'Changing these numbers changes the verdict. They live in core/assumptions.mjs;'],
   'ab.foot2': ['报告、网页、README 三处显示的是同一份，不会各说各话。',
     'the report, the web page and the README all render the same list, so they cannot disagree.'],
+  'ab.contact': ['算错了、有问题、想提建议：', 'Wrong numbers, problems, suggestions:'],
 
   // ── 仓库对比表
   'rt.title': ['量化对比', 'Quantization comparison'],

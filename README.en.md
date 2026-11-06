@@ -524,6 +524,24 @@ Completely different problems. **No template** means the model ships no chat for
 - Windows VRAM "ceiling" includes evictable memory, so numbers can look optimistic while a browser is open. Linux and macOS ceilings use free memory only, so they're stricter — that's intentional.
 - Reading a remote file needs a mirror that responds; when hf-mirror throttles, download the `.gguf` and check it locally.
 
+## Feedback and contact
+
+| What | Where |
+|---|---|
+| Wrong numbers, crashes, a model it cannot recognise | [GitHub Issues](https://github.com/RoRoToCode/vramfit/issues) |
+| Security issues | Email <su@roroto.com>, please do not open an issue |
+| Commercial use, collaboration, redistribution licensing | <su@roroto.com> |
+| You want to change the code yourself | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+
+Issues first: they are public and searchable, so the next person hitting the same
+problem finds the answer without asking again.
+
+Three things in a report save most of the back-and-forth:
+
+1. The model name or HuggingFace link
+2. Your GPU and its VRAM (what `nvidia-smi` shows, or the value you passed to `--vram`)
+3. The output of `node check.mjs --about` — it lists the assumptions actually applied
+
 ## License
 
 **MIT.** Commercial use, closed-source forks, rebranding, bundling into your own product
