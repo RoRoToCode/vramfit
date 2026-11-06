@@ -1,16 +1,18 @@
 # vramfit 网页版
 
-在线地址：<https://www.roroto.com/vramfit>
+在线地址：<https://www.roroto.com/tools/vramfit/>
 
 贴一个 HuggingFace 链接，或者拖一个本地 `.gguf` 进来，不下载模型就能知道：
 **这台机器能开多大上下文、它到底能不能驱动 coding agent。**
 
 纯静态，没有后端，没有环境变量，不需要数据库。服务器只发 HTML 和几个 `.mjs`。
 
-> **语言**：网页目前只有中文。判定结论来自根目录的 `core/`，那层已经支持中英双语
-> （命令行的 `--lang en` 走的就是它），但页面文案和 `web/report.mjs` 还没接进词条表，
-> 所以这里先显式 `setLocale('zh')` 钉住 —— 否则英文系统上会得到「中文界面 + 英文结论」
-> 的半成品。要加切换，先把 `index.html` 和 `report.mjs` 的文案搬进 `core/i18n.mjs`。
+> **语言**：中文和英文。页面文案在 `src/web/strings.mjs`（界面）和根目录的
+> `core/i18n.mjs`（判定结论），两者都按页面的 `<html lang>` 定语言，
+> 所以独立版（`dist/`）跟着 `index.html` 的 `zh-CN` 走中文，而挂到 roroto 站点上时
+> 母站会先注入 `window.__VRAMFIT_LANG`，同一个 `app.mjs` 就能渲染对应语种。
+> 新增语种时注意：这两个词条表要一起加，只加一边会出现「中文界面 + 英文结论」。
+> 西班牙语还没做。
 >
 > **所有结论都是静态推算，仅供参考，需实际加载运行验证。**
 > 算式、参数、误差范围见 [`../README.md`](../README.md#免责声明与参数说明)，
@@ -28,6 +30,7 @@ site/
 │       ├── app.mjs      事件绑定、URL 参数还原、分享链接
 │       ├── gpu.mjs      浏览器显卡识别（WebGL 渲染器 → 型号 → 显存/带宽表）
 │       ├── local.mjs    本地文件读取（File.slice 只读头部，不上传）
+│       ├── strings.mjs  页面界面文案的中英词条 + tx() 取值函数
 │       └── report.mjs   HTML 渲染
 ├── build.mjs            构建：src/ + ../{core,net} → dist/
 ├── serve.mjs            本地预览 dist/
@@ -68,6 +71,14 @@ node serve.mjs      # http://localhost:8788
 ## 部署
 
 把 **`dist/` 整个目录**传上去（不是 `site/`，那里面有源码和构建脚本）。
+
+线上实际用的是另一种挂法：<https://www.roroto.com/tools/vramfit/> 这一页由 roroto 站点自己的
+`build.mjs` 生成外壳（站头、面包屑、侧栏、页脚），工作区里注入的是这里的表单和报告模块。
+所以那边**不用** `dist/index.html`，只同步 `src/web/*.mjs` 和根目录的 `core/` `net/`，
+样式则逐条加上 `.vfit` 前缀，避免 `body` / `h1` / `button` 这类通用选择器改坏站点。
+改了这里的源码，要两边各构建一次（先 `node site/build.mjs`，再站点那边同步 + 构建）。
+
+独立部署（自己的域名、Pages、内网）仍旧按下面来：
 
 - **Cloudflare Pages / Vercel**：构建命令留空，输出目录填 `site/dist`
 - **nginx**：把 `dist/` 里的内容拷进站点目录，比如 `/gguf/`

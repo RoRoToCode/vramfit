@@ -4,7 +4,7 @@
 
 <sub>by [RoRoToCode](https://www.roroto.com) · MIT · the CLI and the web page share one estimator</sub>
 
-> **Try it online**: <https://www.roroto.com/vramfit> — nothing to install, paste a link and read
+> **Try it online**: <https://www.roroto.com/tools/vramfit/> — nothing to install, paste a link and read
 > the answer. The model file never leaves your browser. Use the CLI below for batch runs and
 > scanning a local folder.
 
@@ -54,7 +54,7 @@ the report says "usable as VRAM 21.33 GB" rather than pretending it has a graphi
 **This is a command-line tool**, Node 18+, no dependencies.
 On Windows, double-click `check.cmd` — no flags to remember.
 
-**No Node?** Use the web version: <https://www.roroto.com/vramfit> — paste a link and get an answer,
+**No Node?** Use the web version: <https://www.roroto.com/tools/vramfit/> — paste a link and get an answer,
 your file never leaves the browser. Its source lives in `site/` in this same repo and reuses
 `core/` and `net/` from the root; it is not part of the npm package.
 
@@ -79,7 +79,7 @@ winget install OpenJS.NodeJS.LTS
 Otherwise grab the LTS installer from <https://nodejs.org/>. An older Node exits on
 startup with an upgrade message, rather than failing mid-run on `fetch is not defined`.
 
-**Don't want to install anything?** Use the web version: <https://www.roroto.com/vramfit>.
+**Don't want to install anything?** Use the web version: <https://www.roroto.com/tools/vramfit/>.
 You lose directory scanning, real VRAM readings and `--json`.
 
 ### 0. Install it as a command (optional)
@@ -223,8 +223,9 @@ The boundaries:
   translating them would break every downstream script. Same input, byte-identical output.
 - **`--ascii`** swaps `✓ △ ✗ █ ░ ═` for `+ ~ x # - =` for old consoles and log files.
 
-The web page is Chinese-only for now: it shares the verdict logic with the CLI, but the
-page copy has not been moved into the message table yet.
+The web page ships in Chinese and English, following the language of the page itself:
+interface copy lives in `site/src/web/strings.mjs`, the verdict text in `core/i18n.mjs`,
+and both read the same decision from the page's `<html lang>`. Spanish is not done yet.
 
 ## Platform support
 

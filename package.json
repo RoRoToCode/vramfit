@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "author": "RoRoToCode <su@roroto.com> (https://www.roroto.com)",
-  "homepage": "https://www.roroto.com/vramfit",
+  "homepage": "https://www.roroto.com/tools/vramfit/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/RoRoToCode/vramfit.git"

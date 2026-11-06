@@ -4,7 +4,7 @@
 
 <sub>by [RoRoToCode](https://www.roroto.com) · MIT · 命令行与网页共用同一份推算代码</sub>
 
-> **在线体验**：<https://www.roroto.com/vramfit> —— 不用装任何东西，打开网页贴个链接就有结果，
+> **在线体验**：<https://www.roroto.com/tools/vramfit/> —— 不用装任何东西，打开网页贴个链接就有结果，
 > 模型文件不出浏览器。想批量查、想扫本地目录，再用下面的命令行。
 
 把 `.gguf` 拖进来，或者贴一个 Hugging Face 链接。它读文件头里那几十 KB 元数据
@@ -49,7 +49,7 @@ Apple Silicon 的统一内存、核显的共享内存，算的是同一件事；
 **这是一个命令行工具**，需要 Node 18+，没有任何依赖。
 Windows 下双击 `check.cmd` 就行，不用记参数。
 
-**不想装 Node？** 用网页版：<https://www.roroto.com/vramfit> —— 贴个链接就出结果，
+**不想装 Node？** 用网页版：<https://www.roroto.com/tools/vramfit/> —— 贴个链接就出结果，
 文件不出浏览器。网页版源码也在本仓库的 `site/`，构建时复用根目录的 `core/` 和 `net/`，
 不随 npm 包发布。
 
@@ -57,7 +57,7 @@ English: [README.en.md](README.en.md)
 
 ## 用法
 
-|  | 网页版（roroto.com/vramfit） | 命令行（本仓库） |
+|  | [网页版](https://www.roroto.com/tools/vramfit/) | 命令行（本仓库） |
 |---|---|---|
 | 装东西 | 不需要 | 需要 Node 18+ |
 | 贴 HF 链接 | ✅ | ✅ |
@@ -114,7 +114,8 @@ Windows 下可以 `set VRAMFIT_LANG=en` 再双击 `check.cmd`。
   翻译会直接打断下游脚本；同一份输入在任何机器上都要输出逐字节相同的结果。
 - **`--ascii`** 把 `✓ △ ✗ █ ░ ═` 换成 `+ ~ x # - =`，给老终端和重定向到日志时用。
 
-网页版目前只有中文（它和命令行共用判定逻辑，但页面文案还没接进词条表）。
+网页版的界面和结论都跟着页面语言走，目前有中文和英文：界面文案在 `site/src/web/strings.mjs`，
+判定结论走 `core/i18n.mjs`，两层共用同一次语言判定（看页面 `<html lang>`）。西班牙语还没做。
 
 ## 快速开始
 
@@ -135,7 +136,7 @@ winget install OpenJS.NodeJS.LTS
 或者去 <https://nodejs.org/> 下 LTS 安装包。版本太老会在启动第一行就提示升级，
 不会跑到一半报 `fetch is not defined` 这种看不出原因的错。
 
-**不想装任何东西**：用网页版 <https://www.roroto.com/vramfit>。代价是不能递归扫目录、
+**不想装任何东西**：用网页版 <https://www.roroto.com/tools/vramfit/>。代价是不能递归扫目录、
 不能读实测显存、没有 `--json`。
 
 ### 方式零：装成一个命令（可选）
@@ -274,7 +275,7 @@ safetensors 的体积是 bf16 原文件，得先说"转成 Q4_K_M 之后约 4.6 
 ## 和网页版的关系
 
 网页版源码在仓库的 `site/` 目录，构建时直接读根目录的 `core/` + `net/`，
-部署在 <https://www.roroto.com/vramfit>。npm 包里不含 `site/` —— 装命令行的人不会多下网页。
+部署在 <https://www.roroto.com/tools/vramfit/>。npm 包里不含 `site/` —— 装命令行的人不会多下网页。
 
 两边共用的只有两处，都是纯计算、不含 IO：
 

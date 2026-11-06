@@ -39,7 +39,7 @@ if errorlevel 1 (
   echo    Then double-click this file again.
   echo.
   echo    Just want an answer without installing anything?
-  echo      https://www.roroto.com/vramfit
+  echo      https://www.roroto.com/tools/vramfit/
   echo.
   if not defined VRAMFIT_NO_PAUSE pause
   exit /b 1
