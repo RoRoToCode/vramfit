@@ -67,7 +67,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // 版本号写死在这里，由 test.mjs 对着 package.json 校验 —— 单文件 bin 不去读包元数据，
 // 少一次文件系统访问，也避免 npx 缓存目录里包结构变了就崩。
-const VERSION = '1.0.1'
+const VERSION = '1.0.2'
 
 // ───────────────────────────── GGUF 解析 ─────────────────────────────
 
