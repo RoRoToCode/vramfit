@@ -213,21 +213,41 @@ export function assess(meta, hw, opts = {}) {
 
   // 生成速度：每吐一个 token 要把全部权重从显存读一遍，所以瓶颈是带宽不是算力。
   // 用 RTX 2080 + 9B Q4_K_M 实测校准过：448 × 0.7 / 5.78 = 54.3，实测 53.9（±1%）。
+  // 这是「零上下文、batch=1、全权重驻留显存」的解码峰值：真实解码每步还要读 KV cache，
+  // 另外还有首字延迟、工具执行、排队，所以主界面的实测值必然低于这个数。
   // 部分 offload 时读的是系统内存，速度掉到内存带宽水平；纯 CPU 推理只有这一档。
   const ramBw = hw.ramBandwidthGBps
+  const eff = TUNING.memoryEfficiency
+  const gb = weights / 1e9
   let speed = null
   if (!gpu) {
+    // 效率因子和显存分支共用同一个 TUNING 值：以前这里写死 0.7，
+    // 重新校准时 CPU 分支纹丝不动，两条路径悄悄给出不同口径。
     speed = ramBw
-      ? { bandwidth: ramBw, onVram: null, onRam: (ramBw * 0.7) / (weights / 1e9), efficiency: 0.7, cpu: true }
+      ? { bandwidth: ramBw, onVram: null, onRam: (ramBw * eff) / gb, efficiency: eff, cpu: true }
       : null
   } else if (gpu.bandwidthGBps) {
-    const gb = weights / 1e9
-    const eff = TUNING.memoryEfficiency
     speed = {
       bandwidth: gpu.bandwidthGBps,
       onVram: (gpu.bandwidthGBps * eff) / gb,
       onRam: ramBw ? (ramBw * eff) / gb : null,
       efficiency: eff
+    }
+  }
+
+  // 按建议上下文折减：解码每步除了读权重，还要把整段 KV cache 读一遍。
+  // 带宽和利用率不变时速度 ∝ 1/(权重 + KV)，所以 折减值 = 峰值 × 权重/(权重 + KV)。
+  // 这仍然不是实测，只是把「不计上下文」这条假设的代价算出来，
+  // 让用户能解释「为什么体检写 54、主界面只有 38」。
+  if (speed) {
+    const peak = speed.onVram ?? speed.onRam
+    const kv = best?.kv
+    if (Number.isFinite(peak) && peak > 0 && Number.isFinite(kv) && kv > 0 && best) {
+      speed.atCtx = peak * (weights / (weights + kv))
+      speed.atCtxTokens = best.ctx
+    } else {
+      speed.atCtx = null
+      speed.atCtxTokens = null
     }
   }
 

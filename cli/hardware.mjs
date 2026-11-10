@@ -314,8 +314,16 @@ function detectHardware() {
 
 
 
-function makeHardware(manualVram = 0) {
+function makeHardware(manualVram = 0, gpuIndex = 0) {
   const hw = detectHardware()
+  // 选卡：把要评估的那张换到第一位。
+  // assess() 只认 gpus[0]，这样「整模型装不装得下」自然按这张卡算 ——
+  // 双卡机器上两个模型各跑各的卡，公式一行都不用改。
+  const idx = Math.max(0, Math.min(Math.floor(Number(gpuIndex) || 0), Math.max(0, hw.gpus.length - 1)))
+  if (idx > 0 && hw.gpus.length > 1) {
+    const picked = hw.gpus[idx]
+    hw.gpus = [picked, ...hw.gpus.filter((_, i) => i !== idx)]
+  }
   if (manualVram > 0) {
     // 只替换容量，保留卡名和带宽：--vram 是「假如我有 12G」的假设题，
     // 带宽还按本机的卡算，才不至于把速度估成「—」。

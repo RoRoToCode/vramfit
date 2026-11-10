@@ -194,7 +194,7 @@ export function stripControl(s) {
 export const KV_TYPES = new Set(['f16', 'q8_0', 'q4_0'])
 
 /** 只有这三个选项带值，其余（--json / --no-color）是开关 */
-export const VALUE_FLAGS = new Set(['--kv', '--vram', '--repo', '--mirror', '--lang'])
+export const VALUE_FLAGS = new Set(['--kv', '--vram', '--gpu', '--repo', '--mirror', '--lang'])
 
 /**
  * 把 --kv=q8_0 / --vram=8 / --repo=a/b 拆成两个参数。
@@ -239,6 +239,18 @@ export function parseOptions(argv) {
     else manualVram = n
   }
 
+  // 选卡：一台机器两块卡时，第二个模型要按它自己那张卡的余量算，
+  // 拿第一块卡的数去估必然出错。索引就是 nvidia-smi / llama-server 的设备序号。
+  const gpuIdx = argv.indexOf('--gpu')
+  let gpuIndex = 0
+  if (gpuIdx >= 0) {
+    const raw = argv[gpuIdx + 1]
+    const n = Number(raw)
+    if (!raw || raw.startsWith('--')) problems.push(t('in.p.gpuNeeds'))
+    else if (!Number.isInteger(n) || n < 0) problems.push(t('in.p.gpuBad', { v: raw }))
+    else gpuIndex = n
+  }
+
   const repoIdx = argv.indexOf('--repo')
   let repo = null
   if (repoIdx >= 0) {
@@ -265,5 +277,5 @@ export function parseOptions(argv) {
     }
   }
 
-  return { kvType, manualVram, repo, mirror, problems }
+  return { kvType, manualVram, gpuIndex, repo, mirror, problems }
 }

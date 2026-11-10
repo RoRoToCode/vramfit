@@ -33,7 +33,7 @@ import {
   normalizeArgv, parseOptions, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR,
   quantFromName, shardInfo, totalWeightsBytes, paramCountOf,
   quantRank, quantTier, repoVerdict,
-  GB, TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, fmtSize,
+  GB, TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, fmtSize, speedCapFor,
   vramCeiling, attentionInterval, kvLayers, fullLayerFraction, isHybridSwa, kvBytes,
   analyzeTemplate, assess, attentionReport, verdictOf, headlineOf,
   t, setLocale, getLocale, detectLocale, labelWidth, assumptionsList, localeOf
@@ -44,6 +44,11 @@ import { fetchGguf, listRepoGgufs } from './net/hf.mjs'
 
 // 本机硬件探测是 Node 专属的，网页端靠查表，所以单独一层
 import { makeHardware } from './cli/hardware.mjs'
+
+// repo 模式的重试分支要等几秒（见下方 retryAt）。这个 helper 原先只在
+// net/hf.mjs 里定义，模块作用域不共享，于是「某些量化抓取失败」时会抛
+// "sleep is not defined"，把整轮输出吞掉 —— 表现就是 repo 模式偶尔完全没结果。
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // 版本门槛放在最前面：Node 16 及更早没有全局 fetch，跑起来会死在
 // "fetch is not defined" 这种和真实原因无关的报错上，用户根本想不到是版本问题。
@@ -346,7 +351,7 @@ function render(meta, hw, result, opts = {}) {
   if (result.speed) {
     const sp = result.speed
     const gb = weights / 1e9
-    const cap = gb < TUNING.smallModelGB ? TUNING.speedCapTiny : TUNING.speedCap
+    const cap = speedCapFor(weights)
     section(t('s.speed'))
     const formula = () => note(t('v.formula', { bw: sp.bandwidth, gb: gb.toFixed(2), eff: sp.efficiency }))
     if (sp.cpu) {
@@ -438,6 +443,7 @@ ${opt('--no-color', 'u.optNoColor')}
 ${opt('--ascii', 'u.optAscii')}
 ${opt('--kv <type>', 'u.optKv')}
 ${opt('--vram 8', 'u.optVram')}
+${opt('--gpu 1', 'u.optGpu')}
 ${opt('--mirror <url>', 'u.optMirror')}
 ${opt('--lang zh|en', 'u.optLang')}
 ${opt('--about', 'u.optAbout')}
@@ -539,7 +545,7 @@ function renderRepoTable(repo, rows) {
     const ctx = r.best ? fmtCtx(r.best) : g('—', '-')
     const v = repoVerdict(r)
     L.push(`    ${dpad(labelOf(r), QW)} ${dpad(fmtGB(r.weights), 9, 'right')}  ` +
-      `${dpad(ctx, CTX_W, 'right')}  ${dpad(spdText(r.onVram), 11)} ${dpad(r.qualityLabel, QUAL_W)}  ` +
+      `${dpad(ctx, CTX_W, 'right')}  ${dpad(spdText(r.onVram, r.weights), 11)} ${dpad(r.qualityLabel, QUAL_W)}  ` +
       paint(v.label, v.color))
   }
   L.push('')
@@ -606,8 +612,11 @@ const dpad = (s, width, align = 'left') => {
   return align === 'right' ? pad + s : s + pad
 }
 
-/** 速度和上下文列：拿不到带宽就不写数字，不然会渲染成 "undefined tok/s" */
-const spdText = (onVram) => (Number.isFinite(onVram) && onVram > 0 ? `~${onVram.toFixed(0)} tok/s` : '—')
+/** 速度和上下文列：拿不到带宽就不写数字，不然会渲染成 "undefined tok/s"。封顶与 JSON 同源 */
+const spdText = (onVram, weightsBytes) =>
+  Number.isFinite(onVram) && onVram > 0
+    ? `~${Math.min(onVram, speedCapFor(weightsBytes)).toFixed(0)} tok/s`
+    : '—'
 
 const isUrlLike = (s) => /^https?:\/\//i.test(s)
 // owner/repo 只有两段。排除 ./models、../x 这类相对路径写法，
@@ -795,6 +804,20 @@ async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHard
 }
 
 
+/**
+ * JSON 里的速度必须和命令行主报告同一口径：公式值超过封顶时不报公式值。
+ *
+ * 小模型（< 2 GB）上 kernel launch / 采样是固定开销，带宽公式会给出
+ * 600+ tok/s 这种物理上跑不出来的数字。命令行早就封顶了，JSON 却直接
+ * Math.round 公式值 —— 消费 JSON 的界面于是显示一个大得离谱的速度。
+ * 另外 CPU 推理时 speed.onVram 是 null，Math.round(null) === 0，
+ * 看起来像真测出了 0 tok/s，所以非有限值一律给 null。
+ */
+const jsonSpeed = (v, weightsBytes) =>
+  Number.isFinite(v) && v > 0
+    ? Math.round(Math.min(v, speedCapFor(weightsBytes)))
+    : null
+
 function toJson(results) {
   return results.map((r) => {
     if (r.error) return r
@@ -832,14 +855,18 @@ function toJson(results) {
       recommendedCtx: result.best?.ctx ?? null,
       estimated: result.estimated !== false,
       bandwidth: result.speed?.bandwidth ?? null,
-      // CPU 推理时 speed.onVram 是 null，直接 Math.round 会写成 0 —— 看着像真的测出 0 tok/s
-      genTokPerSec: Number.isFinite(result.speed?.onVram) ? Math.round(result.speed.onVram) : null,
-      genTokPerSecOnCpu: Number.isFinite(result.speed?.onRam) ? Math.round(result.speed.onRam) : null,
+      // 速度口径见 speedBasis：零上下文、batch=1、全权重驻留显存时的解码峰值
+      genTokPerSec: jsonSpeed(result.speed?.onVram, totalBytes),
+      genTokPerSecOnCpu: jsonSpeed(result.speed?.onRam, totalBytes),
+      // 按建议上下文补上 KV cache 读取代价后的折减值，用来解释峰值与实测的差距
+      genTokPerSecAtCtx: jsonSpeed(result.speed?.atCtx, totalBytes),
+      speedCtx: result.speed?.atCtxTokens ?? null,
+      speedBasis: 'zero-context-decode-peak',
       moe: meta.expertCount ? { experts: meta.expertCount, active: meta.expertUsedCount ?? null } : null,
       verdict: verdictOf(meta, result),
       // 这一行故意不跟 --lang 走：JSON 是给脚本消费的，要求同一份输入在任何机器上
       // 产出逐字节相同的结果。跟着系统语言变会让 CI 快照随机失败。
-      disclaimer: '静态推算，仅供参考，需实际加载验证；参数与假设见 --about'
+      disclaimer: '静态推算，仅供参考：速度为零上下文、batch=1、全权重驻留显存时的解码峰值，不含 KV cache 读取、首字延迟与工具执行，实测通常更低；需实际加载验证；参数与假设见 --about'
     }
   })
 }
@@ -955,6 +982,7 @@ export function inputMode({ isTTY, platform }) {
 
 async function interactive(opts = {}) {
   const kvType = opts.kvType ?? 'f16'
+  const gpuIndex = opts.gpuIndex ?? 0
 
   const mode = inputMode({ isTTY: process.stdin.isTTY, platform: process.platform })
   const cooked = mode.cooked
@@ -1051,7 +1079,7 @@ async function interactive(opts = {}) {
 
     try {
       // 每次重新读硬件：显存「已占用」随时在变，缓存住会给出错的可用值
-      const hw = makeHardware(opts.manualVram ?? 0)
+      const hw = makeHardware(opts.manualVram ?? 0, gpuIndex)
 
       const repoCmd = /^(?:repo|--repo)\s+(.+)$/i.exec(s)
       if (repoCmd) {
@@ -1120,7 +1148,7 @@ async function main() {
   if (argv.includes('--about')) { about(); return }
 
   const jsonOut = argv.includes('--json')
-  const { kvType, manualVram, repo, mirror, problems } = parseOptions(argv)
+  const { kvType, manualVram, gpuIndex, repo, mirror, problems } = parseOptions(argv)
   if (problems.length) {
     for (const p of problems) console.error(paint(`  ✗ ${p}`, 'red'))
     console.error(paint(`  ${t('x.helpHint')}`, 'dim'))
@@ -1143,7 +1171,7 @@ async function main() {
     return true
   })
 
-  const hw = makeHardware(manualVram)
+  const hw = makeHardware(manualVram, gpuIndex)
 
   // ── 整仓库对比模式
   if (repo) {
@@ -1161,7 +1189,7 @@ async function main() {
   //    从管道喂链接，三种情况都走这里，粘贴链接永远可用。
   if (!raw.length) {
     if (jsonOut) { usage(); process.exitCode = 1; return }
-    await interactive({ kvType, manualVram })
+    await interactive({ kvType, manualVram, gpuIndex })
     return
   }
 

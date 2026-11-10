@@ -41,14 +41,26 @@ export const TUNING = {  /** 运行时开销：batch / 计算缓冲。RTX 2080 +
   /** 上下文低于这个值，塞不下一个代码文件 */
   minAgentContext: 8192,
 
-  /** 小模型速度封顶：每 token 的固定开销会压住公式值，2 GB 以下最多给 400 */
+  /** 小模型速度封顶：每 token 的固定开销会压住公式值，2 GB 以下最多给 200，其余最多 400 */
   smallModelGB: 2,
   speedCap: 400,
-  /** 更小的模型（< 2 GB）再压一档，实测 0.6B Q4 在 3050 上是 70–120 tok/s */
   speedCapTiny: 200,
 
   /** 速度估算的误差区间（百分比），只用于文案 */
   speedErrorPct: 15
+}
+
+/**
+ * 速度封顶值：命令行主报告和 --json 必须走同一套，不能一个封顶一个不封。
+ *
+ * 为什么会踩坑：原先封顶只写在命令行渲染里，`toJson` 直接把公式值
+ * Math.round 出去。0.5 GB 的小模型在 448 GB/s 的卡上公式给 627 tok/s，
+ * 界面（消费 JSON）就显示 ~627，而命令行写「不到 200」——同一个工具
+ * 两条出口给出两个数，用户只会挑大的那个信。
+ */
+export function speedCapFor(weightsBytes) {
+  const gb = (Number(weightsBytes) || 0) / 1e9
+  return gb > 0 && gb < TUNING.smallModelGB ? TUNING.speedCapTiny : TUNING.speedCap
 }
 
 /** KV cache 每个元素的字节数。q8_0 / q4_0 带 per-block scale，不是整 1 / 0.5 字节 */
@@ -126,20 +138,23 @@ export const ASSUMPTIONS = [
     ]
   },
   {
-    group: ['生成速度', 'Generation speed'],
+    group: ['生成速度（零上下文解码峰值）', 'Generation speed (zero-context decode peak)'],
     items: [
       { k: ['公式', 'Formula'], v: ['带宽 × 0.7 ÷ 权重 GB', 'bandwidth × 0.7 ÷ weight GB'],
-        note: ['瓶颈是带宽不是算力，已按 RTX 2080 + 9B 实测校准（±1%）',
-          'The bottleneck is bandwidth, not compute; calibrated against an RTX 2080 with 9B (±1%)'] },
+        note: ['瓶颈是带宽不是算力，已按 RTX 2080 + 9B 实测校准（±1%）。这是零上下文、batch=1、全权重驻留显存时的理论上限，不是实际能跑到的速度',
+          'Bandwidth-bound, not compute-bound; calibrated against an RTX 2080 with 9B (±1%). This is a theoretical ceiling at zero context, batch=1, all weights resident — not a speed you should expect in practice'] },
+      { k: ['不计上下文', 'Context excluded'], v: ['不计 KV cache 读取', 'KV cache reads excluded'],
+        note: ['解码每步还要把整段 KV cache 读一遍，上下文越长越慢；另给「按建议上下文」的折减值，仍属静态推算',
+          'Each decode step also reads the whole KV cache, so longer contexts are slower. A context-adjusted figure is reported separately; it is still a static estimate'] },
       { k: ['误差', 'Error'], v: ['约 ±15%', 'about ±15%'],
-        note: ['受驱动、batch 设置、KV 精度影响；不含首字延迟',
-          'Depends on driver, batch settings and KV precision; excludes time-to-first-token'] },
-      { k: ['小模型', 'Small models'], v: ['2 GB 以下最多报 400 tok/s', 'under 2 GB reports at most 400 tok/s'],
-        note: ['每 token 的固定开销会压住公式值，公式对小模型失效',
-          'Per-token overhead dominates, so the formula stops holding'] },
+        note: ['受驱动、batch 设置、KV 精度影响；不含首字延迟、工具执行与排队，长上下文下会明显低于峰值',
+          'Depends on driver, batch settings and KV precision; excludes time-to-first-token, tool runs and queueing. Long contexts land well below the peak'] },
+      { k: ['小模型', 'Small models'], v: ['< 2 GB 封顶 200，其余 400 tok/s', 'cap 200 under 2 GB, 400 otherwise'],
+        note: ['每 token 的固定开销会压住公式值，公式对小模型失效；命令行与 JSON 都套用同一个封顶',
+          'Per-token overhead dominates, so the formula stops holding. CLI and JSON apply the same cap'] },
       { k: ['MoE 模型', 'MoE models'], v: ['未计入激活比例', 'activation ratio not modelled'],
-        note: ['MoE 每 token 只读部分专家，实际速度会高于估算',
-          'Only some experts are read per token, so real speed is higher'] }
+        note: ['MoE 每 token 只读部分专家，实际速度会高于估算；界面会提示这一点',
+          'Only some experts are read per token, so real speed is higher; the UI flags this'] }
     ]
   },
   {
@@ -149,8 +164,9 @@ export const ASSUMPTIONS = [
         note: ['所有数字都是静态推算，不是性能测试', 'Every number is a static estimate, not a benchmark'] },
       { k: ['不读真实占用', 'No live usage'], v: ['网页端做不到', 'impossible in a browser'],
         note: ['浏览器不暴露显存占用，只能按用户填的值算', 'Browsers do not expose VRAM usage, so the value you type is used'] },
-      { k: ['不处理多卡', 'Single GPU'], v: ['只看第一块显卡', 'only the first GPU'],
-        note: ['多卡切分、张量并行都不在估算范围内', 'Tensor parallelism and multi-GPU splits are out of scope'] },
+      { k: ['不跨卡切分', 'No cross-GPU split'], v: ['一个模型只放一张卡', 'one model on one GPU only'],
+        note: ['可以用 --gpu 选评估哪张卡，但张量并行 / 逐层切分不在估算范围内',
+          'Use --gpu to pick which card to evaluate; tensor parallelism and layer splits are out of scope'] },
       { k: ['模板只做字符串分析', 'Templates are parsed, not run'], v: ['不代表真实调用成功率', 'not a measure of success rate'],
         note: ['有 tools 分支 ≠ 模型真会稳定调用工具', 'A tools branch ≠ reliable tool calling'] }
     ]

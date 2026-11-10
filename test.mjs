@@ -32,7 +32,8 @@ import {
 
 import {
   TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR, OFFICIAL,
-  setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf
+  setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf,
+  speedCapFor, assumptionLines
 } from './core/index.mjs'
 import { appleWorkingSet } from './cli/hardware.mjs'
 
@@ -606,6 +607,79 @@ test('JSON：CPU 推理的速度不能写成 0 tok/s', () => {
   assert.equal(row.genTokPerSec, null)
   assert.ok(row.genTokPerSecOnCpu > 0)
   assert.equal(row.cpuOnly, true)
+})
+
+// ───────────── 速度口径：零上下文峰值 / 封顶 / 上下文折减 ─────────────
+
+test('速度公式守住 RTX 2080 + 9B Q4 的实测校准点', () => {
+  // core/assess.mjs 注释里那个校准点：448 GB/s × 0.7 ÷ 5.78 GB = 54.3，实测 53.9。
+  // 把它写成断言，免得以后调效率因子时把已验证的校准悄悄改坏。
+  const nineB = { ...meta8b, sizeBytes: 5.78e9 }
+  const hw = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448 }],
+    ramBytes: 32 * GB, ramBandwidthGBps: 50, platform: 'test'
+  }
+  const r = assess(nineB, hw, { weightsBytes: 5.78e9 })
+  assert.ok(Math.abs(r.speed.onVram - 54.3) < 0.2, `公式值偏离校准点：${r.speed.onVram}`)
+  assert.ok(Math.abs(r.speed.onVram / 53.9 - 1) < 0.01, '和实测的差距应在 1% 内')
+})
+
+test('CPU 推理的速度效率因子与 TUNING 同源，不再写死 0.7', () => {
+  const hw = { gpus: [], ramBytes: 16 * GB, ramBandwidthGBps: 60, platform: 'test' }
+  const meta = { ...meta8b, sizeBytes: 4 * GB }
+  const r = assess(meta, hw, { weightsBytes: 4 * GB })
+  assert.equal(r.speed.efficiency, TUNING.memoryEfficiency)
+  const expected = (60 * TUNING.memoryEfficiency) / (4 * GB / 1e9)
+  assert.ok(Math.abs(r.speed.onRam - expected) < 1e-9, `CPU 分支应算出 ${expected}，实际 ${r.speed.onRam}`)
+})
+
+test('速度封顶：小模型的 JSON 不能再把公式值原样报出去', () => {
+  assert.equal(speedCapFor(1.5e9), TUNING.speedCapTiny)
+  assert.equal(speedCapFor(5e9), TUNING.speedCap)
+  assert.equal(speedCapFor(0), TUNING.speedCap, '体积拿不到时按常规档兜底')
+
+  // 0.5 GB 小模型配 448 GB/s 的卡，公式给 627 tok/s —— kernel launch / 采样
+  // 是固定开销，物理上跑不到。命令行早就封顶，JSON 以前却直接 Math.round。
+  const tiny = { ...meta8b, file: 'Qwen3-0.6B-Q4_K_M.gguf', sizeBytes: 0.5e9 }
+  const fastGpu = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448 }],
+    ramBytes: 16 * GB, ramBandwidthGBps: 60, platform: 'test'
+  }
+  const result = assess(tiny, fastGpu, { weightsBytes: 0.5e9 })
+  assert.ok(result.speed.onVram > 600, `公式值应明显超过封顶，实际 ${result.speed.onVram}`)
+
+  const row = toJson([{ meta: tiny, result }])[0]
+  assert.equal(row.genTokPerSec, TUNING.speedCapTiny, 'JSON 与命令行必须同一个封顶')
+  const text = render(tiny, fastGpu, result)
+  assert.ok(!text.includes('627'), '命令行也不该把未封顶的公式值写出来')
+})
+
+test('按建议上下文折减：峰值不含 KV 读取，折减值必须更低', () => {
+  const r = assess(meta8b, hw8b, {})
+  const peak = r.speed.onVram
+  assert.ok(r.speed.atCtx > 0 && r.speed.atCtx < peak,
+    `折减值 ${r.speed.atCtx} 应落在 0 与峰值 ${peak} 之间`)
+  assert.equal(r.speed.atCtxTokens, r.best.ctx)
+  // 带宽与利用率不变时速度 ∝ 1/(权重 + KV)，直接核对公式
+  const expected = peak * r.weights / (r.weights + r.best.kv)
+  assert.ok(Math.abs(r.speed.atCtx - expected) < 1e-9)
+  // 上下文越长折减越多：手工把建议档的 KV 翻倍，速度必须下降
+  const longer = peak * r.weights / (r.weights + r.best.kv * 2)
+  assert.ok(longer < r.speed.atCtx)
+
+  const row = toJson([{ meta: meta8b, result: r }])[0]
+  assert.equal(row.speedBasis, 'zero-context-decode-peak')
+  assert.equal(row.speedCtx, r.best.ctx)
+  assert.ok(row.genTokPerSecAtCtx > 0 && row.genTokPerSecAtCtx < row.genTokPerSec,
+    `折减 ${row.genTokPerSecAtCtx} 应低于峰值 ${row.genTokPerSec}`)
+  assert.match(row.disclaimer, /零上下文/, 'JSON 契约里要写明口径')
+})
+
+test('假设清单：明说峰值「不计上下文」并给出折减说明', () => {
+  const lines = assumptionLines().join('\n')
+  assert.match(lines, /零上下文解码峰值/)
+  assert.match(lines, /不计 KV cache 读取|KV cache 读取/)
+  assert.match(lines, /命令行与 JSON 都套用同一个封顶/)
 })
 
 // ───────────────────────── 报告版式 ─────────────────────────
