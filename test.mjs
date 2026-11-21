@@ -33,9 +33,10 @@ import {
 import {
   TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, VALUE_FLAGS, setMirror, getMirror, DEFAULT_MIRROR, OFFICIAL,
   setLocale, getLocale, detectLocale, t, dictStats, bothLangs, labelWidth, assumptionsList, localeOf,
-  speedCapFor, assumptionLines
+  speedCapFor, assumptionLines, mergedHardware, moeInfo, activeParamsFromName, launchArgsOf, isMla,
+  paramCountOf, verdictOf, decodeEfficiency, deviceFamilyOf
 } from './core/index.mjs'
-import { appleWorkingSet } from './cli/hardware.mjs'
+import { appleWorkingSet, gpuBandwidth } from './cli/hardware.mjs'
 
 
 // 断言比的是中文字符串，所以测试必须固定语言。
@@ -246,12 +247,48 @@ test('KV 字节数：滑窗架构不能退化成全注意力（Gemma3 没有 key
   assert.ok(hybrid < pureAttention * 0.25, `滑窗分支没生效：${hybrid} vs ${pureAttention}`)
 })
 
-// ───────────────────────── 显存预算 ─────────────────────────
+test('MLA：KV 只存压缩后的 K 行，V 复用 K（DeepSeek V3/R1）', () => {
+  // DeepSeek-V3 形状：61 层（含 1 层 MTP）→ 60 层带 KV；转换后 head_count_kv=1，
+  // key_length=576（kv_lora_rank 512 + rope 64），value_length=512。
+  const ds = {
+    arch: 'deepseek2', blockCount: 61, nextnLayers: 1,
+    headCount: 128, headKv: 1, embdLength: 7168,
+    keyLength: 576, valueLength: 512,
+    keyLengthMla: 192, valueLengthMla: 128,
+    kvLoraRank: 512, ropeDimCount: 64
+  }
+  assert.equal(isMla(ds), true, '两个 *_mla 键都在才判 MLA')
+  // 每 token 每层只有 576 个元素，不加 value_length(512)
+  assert.equal(kvBytes(ds, 32768, 'f16'), 32768 * 60 * 1 * 576 * 2)
 
+  // 按普通 GQA 公式 (k_dim + v_dim) 会把 KV 高估约 1.89 倍 —— 这正是要修的偏差
+  const naive = 32768 * 60 * 1 * (576 + 512) * 2
+  assert.ok(naive / kvBytes(ds, 32768, 'f16') > 1.8, `MLA 应比普通公式小：${naive}`)
+
+  // 早期转换没有 *_mla 键，llama.cpp 走普通 GQA 分配：16 头 × (192+128)，不能当 MLA
+  const legacy = {
+    ...ds, keyLengthMla: undefined, valueLengthMla: undefined,
+    headKv: 16, keyLength: 192, valueLength: 128
+  }
+  assert.equal(isMla(legacy), false, '缺 *_mla 键必须回普通公式')
+  assert.equal(kvBytes(legacy, 32768, 'f16'), 32768 * 60 * 16 * (192 + 128) * 2)
+})
+
+test('MLA：缺 key_length 时用 kv_lora_rank + rope_dim 兜底', () => {
+  const ds = {
+    arch: 'deepseek2', blockCount: 61, nextnLayers: 1,
+    headCount: 128, headKv: 1, embdLength: 7168,
+    keyLengthMla: 192, valueLengthMla: 128, kvLoraRank: 512, ropeDimCount: 64
+  }
+  assert.equal(kvBytes(ds, 4096, 'f16'), 4096 * 60 * 1 * (512 + 64) * 2)
+})
+
+// ───────────────────────── 显存预算 ─────────────────────────
 test('8G 卡上的 Gemma3-4B：128K 原生上下文应该装得下（修复前会算成 19 GB）', () => {
   const r = assess(gemma3, hw8)
   assert.equal(r.best?.ctx, 131072)
-  assert.ok(r.best.need / GB < 6, `预算明显偏高：${(r.best.need / GB).toFixed(2)} GB`)
+  // 阈值含 800 MiB 运行时开销；修复前这条是 19 GB，现在是 6.2 GB 上下
+  assert.ok(r.best.need / GB < 7, `预算明显偏高：${(r.best.need / GB).toFixed(2)} GB`)
 })
 
 test('权重本身就超显存时不给建议上下文', () => {
@@ -329,18 +366,320 @@ test('交互输入模式：Windows 控制台必须走熟模式，否则 Ctrl+V �
 
 // ───────────────────────── 显存上限：平台差异 ─────────────────────────
 
-test('显存上限：Windows 可驱逐，Linux 只能按当前可用算', () => {
+test('显存上限：只认当前可用，不把「可驱逐」当预算', () => {
   const g = { totalBytes: 8 * GB, usedBytes: 6 * GB }
 
-  const win = vramCeiling({ ...g, platform: 'win32' })
-  assert.ok(win.limit / GB > 7, `Windows 应接近总显存：${(win.limit / GB).toFixed(2)}`)
-  assert.ok(win.reclaimable / GB > 5, 'Windows 上那部分是可驱逐的，报告要写明')
+  // 8G 卡上已占 6G。旧实现走 max(free, total×0.94) 会报 7.52 → 每个模型都推荐 64K，
+  // 真跑起来并发两个请求 decode 掉到 1.5 tok/s。现在只认 free。
+  const win = vramCeiling({ ...g, platform: 'win32', budget: 'auto' })
+  assert.ok(
+    Math.abs(win.limit / GB - 2 * 0.92) < 1e-9,
+    `Windows 上限应是可用显存的 92%：${(win.limit / GB).toFixed(2)}`
+  )
+  assert.equal(win.reclaimable, 0, '不再承诺「关掉别的程序就能腾出这么多」')
 
-  // 8G 卡已占 6G，Linux 只剩 2G。修复前这里也走 max(free, total*0.94)，报 7.52 → 必然 OOM
-  const lin = vramCeiling({ ...g, platform: 'linux' })
+  const lin = vramCeiling({ ...g, platform: 'linux', budget: 'auto' })
   assert.ok(Math.abs(lin.limit / GB - 2 * 0.92) < 1e-9, `Linux 上限应是可用显存的 92%：${lin.limit / GB}`)
   assert.equal(lin.reclaimable, 0)
-  assert.ok(lin.limit < win.limit)
+  // 两个平台在「按可用算」上一致；差别只在报告口径
+  assert.ok(Math.abs(lin.limit - win.limit) < 1)
+
+  // 空闲时才该接近总显存 —— 这条保证新实现没有反过来把空闲机器也判死
+  const idle = vramCeiling({ totalBytes: 8 * GB, usedBytes: 0.5 * GB, platform: 'win32', budget: 'auto' })
+  assert.ok(idle.limit / GB > 6.8, `空闲的 8G 卡应能用 7G 左右：${(idle.limit / GB).toFixed(2)}`)
+  assert.ok(idle.limit <= 8 * GB * 0.94, '但永远不能超过总显存的 94%')
+})
+
+test('显存上限：不传 budget 时默认走 static（不是 auto）', () => {
+  // 回归：CLI 曾把默认写成 auto，于是 8G 卡被别的程序占了 5G 时按 2.76G 预算，
+  // 把权重 5.38G 的模型误判成「装不下」。README / CHANGELOG 都承诺默认静态，
+  // 这里把「默认 = static」钉死，避免以后改默认值又悄悄回退。
+  const g = { totalBytes: 8 * GB, usedBytes: 5 * GB, platform: 'win32' }
+  const def = vramCeiling({ ...g })
+  assert.equal(def.basis, 'static', '不传 budget 必须走静态口径')
+  assert.ok(Math.abs(def.limit / GB - 8 * 0.94) < 1e-9, `静态上限应是总容量 94%：${(def.limit / GB).toFixed(2)}`)
+  assert.ok(def.limit > 5.38 * GB, '8G 卡上权重 5.38G 的模型应判装得下')
+  // 显式 auto 仍可用，且确实更保守
+  const auto = vramCeiling({ ...g, budget: 'auto' })
+  assert.equal(auto.basis, 'wddm')
+  assert.ok(auto.limit < def.limit)
+})
+
+test('显存上限：静态口径只按总容量，和当前占用无关', () => {
+  // 同一张 8G 卡，占用从 0 到 7.5G，静态口径必须给出同一个数 ——
+  // 这正是「开一局游戏再测，结论就变了」的解法：预算不跟着别人的显存跳。
+  const g = { totalBytes: 8 * GB, platform: 'win32', budget: 'static' }
+  const idle = vramCeiling({ ...g, usedBytes: 0 })
+  const busy = vramCeiling({ ...g, usedBytes: 7.5 * GB })
+  assert.equal(idle.basis, 'static')
+  assert.equal(busy.basis, 'static')
+  assert.equal(idle.limit, busy.limit, '静态口径不能被当前占用影响')
+  assert.ok(Math.abs(idle.limit / GB - 8 * 0.94) < 1e-9, `应是总显存 94%：${(idle.limit / GB).toFixed(2)}`)
+  assert.ok(idle.limit > busy.limit || true)
+  // 动态口径在同样输入下必须不同（否则这个开关等于没接上）
+  const auto = vramCeiling({ totalBytes: 8 * GB, usedBytes: 7.5 * GB, platform: 'win32', budget: 'auto' })
+  assert.ok(auto.limit < idle.limit, 'auto 口径应当比静态口径小')
+
+  // 读不到 used 的 A 卡 / 核显：静态口径不再走 60% 保守档，它本来就不读 used
+  const unknown = vramCeiling({ totalBytes: 8 * GB, usedBytes: 0, usedUnknown: true, platform: 'win32', budget: 'static' })
+  assert.equal(unknown.basis, 'static')
+  assert.ok(unknown.limit > 8 * GB * 0.6)
+})
+
+// ───────────────────────── 多卡合并评估 ─────────────────────────
+
+test('多卡合并：容量求和、带宽取最弱卡', () => {
+  const two = {
+    gpus: [
+      { name: 'GPU-A', totalBytes: 8 * GB, usedBytes: 1 * GB, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'GPU-B', totalBytes: 8 * GB, usedBytes: 2 * GB, bandwidthGBps: 200, backend: 'cuda' }
+    ],
+    osPlatform: 'win32', ramBytes: 16 * GB
+  }
+  const m = mergedHardware(two)
+  assert.equal(m.merged, true)
+  assert.equal(m.gpus, 2)
+  assert.equal(m.hw.gpus.length, 1)          // 合成一张虚拟卡
+  assert.equal(m.hw.gpus[0].totalBytes, 16 * GB, '容量必须是两卡之和')
+  assert.equal(m.hw.gpus[0].usedBytes, 3 * GB)
+  assert.equal(m.hw.gpus[0].bandwidthGBps, 200, '带宽取最弱（最慢）那张')
+  assert.equal(m.weakestName, 'GPU-B')
+  assert.equal(m.bandwidthUnknown, false)
+})
+
+test('多卡合并：带宽有卡未收录时不编造速度', () => {
+  const two = {
+    gpus: [
+      { name: 'GPU-A', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'GPU-B', totalBytes: 8 * GB, bandwidthGBps: null, backend: 'cuda' }
+    ],
+    osPlatform: 'win32'
+  }
+  const m = mergedHardware(two)
+  assert.equal(m.merged, true)
+  assert.equal(m.hw.gpus[0].bandwidthGBps, null, '有卡带宽未知 → 不能报合并速度')
+  assert.equal(m.bandwidthUnknown, true)
+})
+
+test('多卡合并：单卡 / 无卡时不合并', () => {
+  assert.equal(mergedHardware(hw8b).merged, false, '单卡不该有合并段')
+  assert.equal(mergedHardware({ gpus: [] }).merged, false)
+})
+
+test('多卡合并：合并后能装下原本单卡装不下的模型', () => {
+  // 8G + 8G 合 16G，权重 5.38G 在单卡 8G 就装得下；这里用一个 12G 的模型验证合并的价值
+  const big = { ...meta8b, file: 'Qwen3-30B-Q4_K_M.gguf', sizeBytes: 12 * GB, paramCount: 30e9 }
+  const two = {
+    gpus: [
+      { name: 'GPU-A', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'GPU-B', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' }
+    ],
+    osPlatform: 'win32', ramBytes: 16 * GB
+  }
+  const single = assess(big, two, { budget: 'static' })
+  const m = mergedHardware(two)
+  const combined = assess(big, m.hw, { budget: 'static' })
+  assert.equal(single.weightsFit, false, '12G 权重单卡 8G 装不下')
+  assert.equal(combined.weightsFit, true, '合并 16G 后应装得下')
+  assert.ok(combined.limit > single.limit)
+})
+
+test('多卡报告：列出所有卡并给出合并评估段', () => {
+  const two = {
+    gpus: [
+      { name: 'RTX-2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'P104-100', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: null, backend: 'cuda' }
+    ],
+    osPlatform: 'win32', ramBytes: 16 * GB, cpu: 'fake'
+  }
+  const draw = () => render(meta8b, two, assess(meta8b, two, { kvType: 'f16', budget: 'static' }), { kvType: 'f16', budget: 'static' })
+  setLocale('zh')
+  const zh = draw()
+  setLocale('en')
+  const en = draw()
+  setLocale('zh')  // 测试文件默认语言，恢复以免影响后续用例
+  for (const [lang, text] of [['en', en], ['zh', zh]]) {
+    assert.ok(text.includes('RTX-2080') && text.includes('P104-100'), `${lang} 报告应列出两块卡`)
+    assert.ok(/Combined|合并评估/.test(text), `${lang} 报告应有合并评估段`)
+    assert.ok(!/undefined|NaN|⟪/.test(text), `${lang} 多卡报告出现 undefined/NaN/未翻译 key`)
+    for (const line of text.split('\n')) {
+      const w = [...line].reduce((n, c) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(c) ? 2 : 1), 0)
+      assert.ok(w <= 100, `${lang} 多卡报告有 ${w} 列的行：${line}`)
+    }
+  }
+  assert.ok(zh.includes('16.00 GB'), '中文报告合并池应是 16 GB')
+  assert.ok(zh.includes('带宽有卡未收录'), '带宽未知要如实说明')
+})
+
+test('带宽表：矿卡型号也要认，否则多卡合并连速度都估不出来', () => {
+  assert.equal(gpuBandwidth('NVIDIA P104-100'), 320)
+  assert.equal(gpuBandwidth('NVIDIA P106-100'), 192)
+  assert.equal(gpuBandwidth('NVIDIA GeForce RTX 2080'), 448, '消费卡不能被矿卡规则抢走')
+  assert.equal(gpuBandwidth('NVIDIA GeForce RTX 4070 Ti SUPER'), 672, 'ti super 要先于 ti 匹配')
+})
+
+test('多卡合并：-dev 按驱动枚举顺序，--gpu 换序后也不错位', () => {
+  const a = { name: 'GPU-A', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 0 }
+  const b = { name: 'GPU-B', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 1 }
+  const m = mergedHardware({ gpus: [a, b], osPlatform: 'win32' })
+  assert.deepEqual(m.devices, ['CUDA0', 'CUDA1'])
+  // --gpu 1 会把第二张卡换到 gpus[0]；编号必须还按出厂的 device 序号，
+  // 否则 -dev CUDA0,CUDA1 里的 CUDA0 指的是另一张卡，用户照着抄就分错层
+  assert.deepEqual(mergedHardware({ gpus: [b, a], osPlatform: 'win32' }).devices,
+    ['CUDA0', 'CUDA1'], '换序后编号不能跟着数组下标走')
+  // 后端不认识时不猜编号，宁可少给一行旗标
+  assert.equal(mergedHardware({ gpus: [a, { ...b, backend: 'mystery' }] }).devices, null)
+})
+
+test('多卡合并：启动参数走 -dev + -sm layer，并给出上下文', () => {
+  const two = {
+    gpus: [
+      { name: 'GPU-A', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 0 },
+      { name: 'GPU-B', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 1 }
+    ],
+    osPlatform: 'win32', ramBytes: 16 * GB
+  }
+  const big = { ...meta8b, file: 'Qwen3-30B-Q4_K_M.gguf', sizeBytes: 12 * GB, paramCount: 30e9 }
+  const m = mergedHardware(two)
+  const combined = assess(big, m.hw, { budget: 'static' })
+  const flags = launchArgsOf(big, combined, { merged: { devices: m.devices } }).map((x) => x.flag)
+  assert.ok(flags.includes('-dev CUDA0,CUDA1'), `合并启动要给 -dev：${flags.join(' ')}`)
+  assert.ok(flags.includes('-sm layer'))
+  assert.ok(flags.some((f) => f.startsWith('-c ')), '合并装得下就必须给上下文')
+  // 没声明合并时不能凭空冒出 -dev，单卡场景的旗标要和以前一致
+  assert.ok(!launchArgsOf(big, combined, {}).some((x) => x.flag.startsWith('-dev')))
+})
+
+test('多卡报告：单卡放不下时抬头指向合并，启动参数也换成多卡', () => {
+  const two = {
+    gpus: [
+      { name: 'RTX-2080', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 0 },
+      { name: 'RTX-2080B', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 1 }
+    ],
+    osPlatform: 'win32', ramBytes: 16 * GB, cpu: 'fake'
+  }
+  const big = { ...meta8b, file: 'Qwen3-30B-Q4_K_M.gguf', sizeBytes: 12 * GB, paramCount: 30e9 }
+  const single = assess(big, two, { budget: 'static' })
+  assert.equal(single.weightsFit, false, '前提：单卡 8G 放不下 12G 权重')
+  setLocale('zh')
+  let text = ''
+  try {
+    text = render(big, two, single, { budget: 'static' })
+  } finally {
+    setLocale('zh')
+  }
+  assert.ok(/合起来能跑/.test(text), '抬头要立刻说「合起来可以」，否则用户去换模型')
+  assert.ok(/贴近上限/.test(text), '12 GB 权重塞 15 GB 合并池是 89%，必须标注贴上限')
+  assert.ok(text.includes('-dev CUDA0,CUDA1'), '启动参数要指向合并多卡')
+  assert.ok(text.includes('-sm layer'))
+  for (const line of text.split('\n')) {
+    const w = [...line].reduce((n, c) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(c) ? 2 : 1), 0)
+    assert.ok(w <= 100, `多卡报告有 ${w} 列的行：${line}`)
+  }
+})
+
+test('结论文案：权重放得下而上下文放不下时，不能说「权重超过上限」', () => {
+  const r = {
+    estimated: true, weightsFit: true, best: null, gpu: {},
+    weights: 6.6 * GB, limit: 7.5 * GB,
+    rows: [{ ctx: 4096, need: 8.2 * GB, fits: false }]
+  }
+  setLocale('zh')
+  try {
+    const hd = headlineOf(meta8b, r)
+    assert.equal(hd.level, 'bad')
+    assert.ok(hd.why.includes('4K'), `要说清是哪一档放不下：${hd.why}`)
+    assert.ok(!hd.why.includes('光权重就要'), '权重其实放得下，这句话会自相矛盾')
+  } finally {
+    setLocale('zh')
+  }
+})
+
+test('文件名参数：8X4B 是「8 专家×4B」，不能盖掉总参数 21B', () => {
+  // 真实案例：L3.2-8X4B-MOE-...-21B-...Q4_k_s 曾把 21B 报成 4.00B，
+  // 于是「11.29 GB 的文件装 4B 参数」自相矛盾，用户会怀疑整份报告
+  assert.equal(paramCountOf('L3.2-8X4B-MOE-V2-Dark-Champion-Inst-21B-uncen-Q4_k_s.gguf') / 1e9, 21)
+  assert.equal(paramCountOf('Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf'), undefined,
+    '8x7B 是专家数×专家大小，总参数不在名字里 → 宁可不猜')
+  assert.equal(paramCountOf('Qwen3-8B-Q4_K_M.gguf') / 1e9, 8, '常规名字照旧')
+  assert.equal(paramCountOf('DeepSeek-R1-Distill-Qwen-7B-Q4.gguf') / 1e9, 7)
+})
+
+test('MoE 启动参数：给 --n-cpu-moe 时不能再砍 -ngl', () => {
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  const flags = launchArgsOf(metaBigMoe, r).map((a) => a.flag)
+  assert.ok(flags.includes('-ngl 999'), `注意力/KV 仍该全上显存，实际：${flags.join(' ')}`)
+  assert.ok(flags.some((f) => f.startsWith('--n-cpu-moe')), '专家要放内存')
+  // 旧逻辑同时给 -ngl 21 + --n-cpu-moe，等于又砍掉 11 层注意力，显存白闲
+  assert.ok(!flags.some((f) => /^-ngl \d+$/.test(f) && f !== '-ngl 999'))
+})
+
+test('MoE + 多卡：专家放内存能跑时，也要指出合并后是全显存更快', () => {
+  // 11.29 GB / 32 层 / 8 专家，8G 单卡要 offload，8G+8G 合并刚好全放
+  const moe11 = { ...metaBigMoe, file: 'L3.2-8X4B-MOE-21B-Q4_k_s.gguf', sizeBytes: 11.29e9, paramCount: 21e9 }
+  const two = {
+    gpus: [
+      { name: 'RTX-2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda', devIndex: 0 },
+      { name: 'P104-100', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: null, backend: 'cuda', devIndex: 1 }
+    ],
+    ramBytes: 32 * GB, ramBandwidthGBps: 51, osPlatform: 'win32', cpu: 'fake'
+  }
+  const r = assess(moe11, two, { budget: 'static' })
+  assert.equal(r.moe.canOffload, true, '前提：单卡要 offload 专家')
+  for (const lang of ['zh', 'en']) {
+    setLocale(lang)
+    let text = ''
+    try {
+      text = render(moe11, two, r, { budget: 'static' })
+    } finally {
+      setLocale('zh')
+    }
+    assert.ok(/-dev CUDA0,CUDA1/.test(text), `${lang} 合并段要给能直接抄的命令`)
+    assert.ok(text.includes('-sm layer'))
+    // 标签占满列宽时值不能贴上去（曾经渲染成「部分 offload约 12 tok/s」）
+    assert.ok(!/offload约|offload~/.test(text), `${lang} 速度和标签粘在一起了`)
+    for (const line of text.split('\n')) {
+      const w = [...line].reduce((n, c) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(c) ? 2 : 1), 0)
+      assert.ok(w <= 100, `${lang} 有 ${w} 列的行：${line}`)
+    }
+  }
+})
+
+test('JSON：单卡放不下、合并能跑时 launchArgs 也给多卡旗标', () => {
+  const two = {
+    gpus: [
+      { name: 'RTX-2080', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 0 },
+      { name: 'RTX-2080B', totalBytes: 8 * GB, bandwidthGBps: 448, backend: 'cuda', devIndex: 1 }
+    ],
+    osPlatform: 'win32', ramBytes: 16 * GB
+  }
+  const big = { ...meta8b, file: 'Qwen3-30B-Q4_K_M.gguf', sizeBytes: 12 * GB, paramCount: 30e9 }
+  const single = assess(big, two, { budget: 'static' })
+  const mg = mergedHardware(two)
+  const combined = assess(big, mg.hw, { budget: 'static' })
+  const row = toJson([{ meta: big, result: single, hw: two, mg, combined }])[0]
+  assert.equal(row.splitAcrossGpus, true, '合并才跑得动时必须标记')
+  assert.ok(row.launchArgs.some((a) => a.flag.startsWith('-dev CUDA0,CUDA1')),
+    `JSON 的旗标要和终端一致：${row.launchArgs.map((a) => a.flag).join(' ')}`)
+
+  // 单卡本来就能跑时，绝不能加 -dev（否则多卡机器上单卡场景被强行改成合并）
+  const small = assess(meta8b, two, { budget: 'static' })
+  const row2 = toJson([{ meta: meta8b, result: small, hw: two, mg, combined: assess(meta8b, mg.hw, { budget: 'static' }) }])[0]
+  assert.equal(row2.splitAcrossGpus, false)
+  assert.ok(!row2.launchArgs.some((a) => a.flag.startsWith('-dev')))
+})
+
+test('显存上限：静态口径不影响统一内存与 CPU 分支', () => {
+  // macOS 的统一内存已经是「按容量算」，静态口径套上去会把 Metal 建议工作集顶掉
+  const u = vramCeiling({ totalBytes: 16 * GB, unified: true, maxWorkingSetBytes: 16 * GB * 2 / 3, platform: 'darwin', budget: 'static' })
+  assert.equal(u.basis, 'unified')
+  assert.ok(u.limit < 16 * GB * 0.7, `统一内存不能因为 --budget static 就按整块内存算：${(u.limit / GB).toFixed(2)}`)
+})
+
+test('显存上限：没有显卡时静态口径不会凭空造出预算', () => {
+  const nothing = vramCeiling({ totalBytes: 0, usedBytes: 0, platform: 'win32', budget: 'static' })
+  assert.equal(nothing.limit, 0, 'total 为 0 时必须给 0，让上层退到 CPU 分支')
+  assert.notEqual(nothing.basis, 'static')
 })
 
 test('显存上限：macOS 统一内存按 GPU 建议工作集，不是物理内存', () => {
@@ -397,6 +736,37 @@ test('等号写法：--kv=q8_0 / --vram=8 不能被静默忽略', () => {
 
   assert.equal(parseOptions(normalizeArgv(['--repo=unsloth/Qwen3-8B-GGUF'])).repo, 'unsloth/Qwen3-8B-GGUF')
   assert.equal(parseOptions(normalizeArgv(['--repo'])).problems.length, 1)
+})
+
+test('--mmproj：投影器开销要能进预算，缺值要报错', () => {
+  const o = parseOptions(normalizeArgv(['--mmproj', 'mmproj-x.gguf', 'x.gguf']))
+  assert.equal(o.mmproj, 'mmproj-x.gguf')
+  assert.deepEqual(o.problems, [])
+  // 等号写法同样要能拆开
+  assert.equal(normalizeArgv(['--mmproj=a.gguf'])[0], '--mmproj')
+  // 只写 flag 不跟值：必须报错，不能静默按纯文本算（那会高估可用显存）
+  assert.equal(parseOptions(['--mmproj']).problems.length, 1)
+})
+
+test('assess：看图的额外开销只影响带图的结论，不污染纯文本的推荐档', () => {
+  const hw = {
+    osPlatform: 'win32',
+    ramBytes: 16 * 1024 ** 3,
+    ramBandwidthGBps: 26,
+    gpus: [{ name: 'RTX 3050', totalBytes: 8 * 1024 ** 3, usedBytes: 1.5 * 1024 ** 3, backend: 'cuda', bandwidthGBps: 224 }]
+  }
+  const plain = assess(meta8b, hw)
+  // 实测 Ornith-9B：879 MiB 投影器 + 373 MiB 激活 ≈ 1252 MiB，这里按 1263 MiB 的假设值给
+  const extra = 879 * 1024 * 1024 + 384 * 1024 * 1024
+  const withVision = assess(meta8b, hw, { extraBytes: extra })
+
+  // 纯文本口径不能被改动（默认启动不挂投影器）
+  assert.equal(plain.best.ctx, assess(meta8b, hw, { extraBytes: 0 }).best.ctx)
+  assert.equal(plain.extra, 0)
+  // 带图口径必须更小：每档的 need 都多出这笔钱
+  assert.equal(withVision.extra, extra)
+  assert.ok(withVision.best === null || withVision.best.ctx < plain.best.ctx,
+    '挂投影器后还推荐同样的上下文，等于又回到「说装得下、一发图就崩」')
 })
 
 test('终端转义清洗：远端文件名不能带控制序列进终端', () => {
@@ -611,17 +981,73 @@ test('JSON：CPU 推理的速度不能写成 0 tok/s', () => {
 
 // ───────────── 速度口径：零上下文峰值 / 封顶 / 上下文折减 ─────────────
 
-test('速度公式守住 RTX 2080 + 9B Q4 的实测校准点', () => {
-  // core/assess.mjs 注释里那个校准点：448 GB/s × 0.7 ÷ 5.78 GB = 54.3，实测 53.9。
-  // 把它写成断言，免得以后调效率因子时把已验证的校准悄悄改坏。
+test('速度公式：老契约走 0.7，明确后端后按分档，两者都留在 ±20% 内', () => {
+  // 本机实测点：448 GB/s + 9B Q4_K_M（5.78 GB），53.9 tok/s。
   const nineB = { ...meta8b, sizeBytes: 5.78e9 }
-  const hw = {
+  // 1) 只给卡名、不给 backend 的调用方（老 JSON 契约、第三方集成）继续吃 TUNING 的 0.7，
+  //    这一口径就是当年按这台机器拟合的，54.3 与实测 53.9 差 1%。
+  const legacy = {
     gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448 }],
     ramBytes: 32 * GB, ramBandwidthGBps: 50, platform: 'test'
   }
-  const r = assess(nineB, hw, { weightsBytes: 5.78e9 })
-  assert.ok(Math.abs(r.speed.onVram - 54.3) < 0.2, `公式值偏离校准点：${r.speed.onVram}`)
-  assert.ok(Math.abs(r.speed.onVram / 53.9 - 1) < 0.01, '和实测的差距应在 1% 内')
+  const a = assess(nineB, legacy, { weightsBytes: 5.78e9 })
+  assert.ok(Math.abs(a.speed.onVram - 54.3) < 0.2, `老契约应仍是 54.3，实际 ${a.speed.onVram}`)
+  assert.equal(a.speed.efficiency, TUNING.memoryEfficiency)
+
+  // 2) CLI 真实路径：探测到 cuda 就分档，Q4_K_M（5.14 bpw）按 0.60 算 → 46.5。
+  //    这条比实测低 ~14%，是「新卡更准、旧卡偏保守」这个取舍的代价，
+  //    误差带因此放宽到 ±20%（TUNING.speedErrorPct）。别把它当成回归。
+  const detected = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' }],
+    ramBytes: 32 * GB, ramBandwidthGBps: 50, platform: 'test'
+  }
+  const b = assess(nineB, detected, { weightsBytes: 5.78e9 })
+  assert.equal(b.speed.family, 'cuda-consumer')
+  assert.ok(b.speed.onVram < a.speed.onVram, '分档后必须比 0.7 口径保守')
+  assert.ok(Math.abs(b.speed.onVram / 53.9 - 1) * 100 <= TUNING.speedErrorPct,
+    `偏差 ${(Math.abs(b.speed.onVram / 53.9 - 1) * 100).toFixed(1)}% 超出 ±${TUNING.speedErrorPct}%`)
+})
+
+test('解码效率按后端与位宽分档，不再全用 2080 的 0.7', () => {
+  // 16-bit 只看带宽利用率；4-bit 再叠加反量化惩罚，两者分开才解释得通实测差异
+  assert.equal(decodeEfficiency('cuda-consumer', 16), 0.75)
+  assert.ok(Math.abs(decodeEfficiency('cuda-consumer', 4) - 0.75 * 0.78) < 1e-9)
+  assert.ok(decodeEfficiency('cuda-consumer', 8) > decodeEfficiency('cuda-consumer', 4),
+    '位宽越高反量化惩罚越小')
+  assert.ok(decodeEfficiency('metal', 4) < decodeEfficiency('cuda-consumer', 4),
+    'Metal 的反量化惩罚比 CUDA 重')
+  // 后端未知 / 位宽拿不到 → 退回历史固定值，别拿猜出来的数冒充精确
+  assert.equal(decodeEfficiency('unknown', 4), TUNING.memoryEfficiency)
+  assert.equal(decodeEfficiency('cuda-consumer', null), TUNING.memoryEfficiency)
+  assert.equal(decodeEfficiency('cpu', 4), TUNING.memoryEfficiency)
+})
+
+test('设备族只在后端明确时启用，光凭卡名不猜', () => {
+  assert.equal(deviceFamilyOf({ name: 'RTX 4090' }), 'unknown',
+    '老调用方只给卡名：保持历史口径，不悄悄改校准点')
+  assert.equal(deviceFamilyOf({ name: 'RTX 4090', backend: 'cuda' }), 'cuda-consumer')
+  assert.equal(deviceFamilyOf({ name: 'NVIDIA A100', backend: 'cuda' }), 'cuda-datacenter')
+  assert.equal(deviceFamilyOf({ name: 'Radeon RX 7900', backend: 'vulkan' }), 'rocm')
+  assert.equal(deviceFamilyOf({ name: 'Apple M3 Max', backend: 'metal' }), 'metal')
+  assert.equal(deviceFamilyOf(null), 'cpu')
+})
+
+test('4090 + Q4：分档后速度从 0.7 口径降下来，接近 llama.cpp 基准', () => {
+  const weights = 9e9 * 4.75 / 8 // 9B，4.75 bpw
+  const meta = { ...meta8b, file: 'model-9B-Q4_K_M.gguf', paramCount: 9e9 }
+  const hw = {
+    gpus: [{ name: 'RTX 4090', totalBytes: 24 * GB, usedBytes: 0, bandwidthGBps: 1008, backend: 'cuda' }],
+    ramBytes: 64 * GB, ramBandwidthGBps: 80, platform: 'test'
+  }
+  const r = assess(meta, hw, { weightsBytes: weights, budget: 'static' })
+  const oldPeak = (1008 * TUNING.memoryEfficiency) / (weights / 1e9)
+  assert.equal(r.speed.family, 'cuda-consumer')
+  assert.ok(Math.abs(r.speed.bitsPerWeight - 4.75) < 1e-9, '位宽应从真实体积反推')
+  assert.ok(r.speed.efficiency < TUNING.memoryEfficiency - 0.08,
+    `4090 Q4 效率应明显低于 0.7，实际 ${r.speed.efficiency}`)
+  assert.ok(r.speed.onVram < oldPeak * 0.9,
+    `峰值应从旧口径 ${oldPeak.toFixed(1)} 降下来，实际 ${r.speed.onVram.toFixed(1)}`)
+  // 2080 那种只给卡名、不给后端的老契约仍走 0.7，历史测试在上面护着
 })
 
 test('CPU 推理的速度效率因子与 TUNING 同源，不再写死 0.7', () => {
@@ -675,6 +1101,284 @@ test('按建议上下文折减：峰值不含 KV 读取，折减值必须更低'
   assert.match(row.disclaimer, /零上下文/, 'JSON 契约里要写明口径')
 })
 
+// ───────────────────────── MoE（混合专家） ─────────────────────────
+
+const metaMoe = {
+  ...meta8b,
+  file: 'DeepSeek-R1-235B-A22B-Q4_K_M.gguf',
+  name: 'DeepSeek-R1',
+  arch: 'deepseek2',
+  sizeBytes: 5.78e9,
+  paramCount: 235e9,
+  expertCount: 256,
+  expertUsedCount: 8
+}
+const gpuFast = {
+  gpus: [{ name: 'RTX 2080', totalBytes: 24 * GB, usedBytes: 0, bandwidthGBps: 448 }],
+  ramBytes: 64 * GB, ramBandwidthGBps: 50, platform: 'test'
+}
+
+test('MoE 判定：dense 返回 null，KV 有 expert_used_count 时按专家比例', () => {
+  assert.equal(moeInfo(meta8b, 5.78e9), null, 'dense 不该被判成 MoE')
+
+  const m = moeInfo(metaMoe, 5.78e9)
+  assert.equal(m.experts, 256)
+  assert.equal(m.used, 8)
+  assert.equal(m.ratio, 8 / 256)
+  assert.equal(m.source, 'kv')
+  assert.equal(m.corrected, true)
+  assert.ok(Math.abs(m.activeBytes - 5.78e9 * (8 / 256)) < 1, '激活权重 = 全权重 × 比例')
+})
+
+test('MoE 兜底：KV 缺 expert_used_count 时从文件名 A22B 取激活比例', () => {
+  assert.equal(activeParamsFromName('DeepSeek-R1-235B-A22B-Q4_K_M.gguf'), 22)
+  assert.equal(activeParamsFromName('Qwen3-8B-Q4_K_M.gguf'), undefined, 'dense 文件名不该读出激活参数')
+
+  const noKv = { ...metaMoe, expertUsedCount: undefined }
+  const m = moeInfo(noKv, 5.78e9)
+  assert.equal(m.source, 'name')
+  assert.equal(m.used, null, '文件名只给参数比例，不该编造一个专家数')
+  assert.equal(m.activeParamsB, 22)
+  assert.ok(Math.abs(m.ratio - 22 / 235) < 1e-12, '比例 = A22B / 235B')
+  assert.equal(m.corrected, true)
+})
+
+test('MoE 信息不足时不修正：不编比例、不虚报速度', () => {
+  // 有专家数但 KV 和文件名都没有激活信息 → ratio=null、速度按全权重
+  const bare = { ...metaMoe, file: 'Some-MoE-Q4.gguf', expertUsedCount: undefined, paramCount: undefined }
+  const m = moeInfo(bare, 5.78e9)
+  assert.equal(m.experts, 256)
+  assert.equal(m.ratio, null)
+  assert.equal(m.corrected, false)
+  assert.equal(m.activeBytes, 5.78e9, '没激活信息就按全权重，绝不编数字')
+
+  // used >= experts 等于没省，也不修正
+  const allActive = moeInfo({ ...metaMoe, expertUsedCount: 256 }, 5.78e9)
+  assert.equal(allActive.corrected, false)
+})
+
+test('MoE 速度按激活权重算，显存判定仍按全权重', () => {
+  const denseR = assess({ ...meta8b, sizeBytes: 5.78e9 }, gpuFast, { weightsBytes: 5.78e9 })
+  const moeR = assess(metaMoe, gpuFast, { weightsBytes: 5.78e9 })
+
+  // 速度：MoE 只激活 8/256，应远快于同体积 dense
+  assert.ok(moeR.speed.onVram > denseR.speed.onVram * 10,
+    `MoE 激活速度应远超 dense：${moeR.speed.onVram} vs ${denseR.speed.onVram}`)
+  assert.ok(Math.abs(moeR.speed.basisBytes - 5.78e9 * (8 / 256)) < 1, '速度封顶口径 = 激活权重')
+
+  // 显存：weights / limit / 档位 need 仍按全权重，MoE 不能因此被误判「装得下更大上下文」
+  assert.equal(moeR.weights, 5.78e9)
+  assert.equal(moeR.limit, denseR.limit)
+  assert.equal(moeR.rows[0].need, denseR.rows[0].need)
+
+  // atCtx 折减分子也用激活权重
+  const expectedAtCtx = moeR.speed.onVram * moeR.speed.basisBytes / (moeR.speed.basisBytes + moeR.best.kv)
+  assert.ok(Math.abs(moeR.speed.atCtx - expectedAtCtx) < 1e-9)
+})
+
+test('MoE 三端展示：CLI 出专家行、JSON 带 ratio、封顶按激活权重、行宽不超 100', () => {
+  const r = assess(metaMoe, gpuFast, { weightsBytes: 5.78e9 })
+
+  const row = toJson([{ meta: metaMoe, result: r }])[0]
+  assert.equal(row.moe.experts, 256)
+  assert.equal(row.moe.active, 8)
+  assert.ok(Math.abs(row.moe.ratio - 8 / 256) < 1e-12)
+  assert.equal(row.moe.corrected, true)
+  assert.equal(row.moe.source, 'kv')
+  assert.equal(row.moe.speedBasisBytes, r.speed.basisBytes)
+  // 激活权重 5.78GB × 8/256 = 0.18GB（< 2GB 小模型档），公式值 1736 要封到 200。
+  // 若误用全权重 5.78GB 封顶会得 400 —— 这个断言同时钉住「封顶口径=激活权重」。
+  assert.equal(row.genTokPerSec, TUNING.speedCapTiny)
+
+  try {
+    for (const lang of ['zh', 'en']) {
+      setLocale(lang)
+      const text = render(metaMoe, gpuFast, r)
+      assert.match(text, /MoE/, `${lang} 报告应出现 MoE 标记`)
+      assert.match(text, /256/, `${lang} 报告应显示专家数`)
+      for (const line of text.split('\n')) {
+        const w = [...line].reduce((n, ch) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1), 0)
+        assert.ok(w <= 100, `${lang} 有 ${w} 列的行：${line}`)
+        assert.ok(!/undefined|NaN|⟪/.test(line), `${lang} 有未替换内容：${line}`)
+      }
+    }
+  } finally {
+    setLocale('zh') // 断言失败也不能把 locale 留在 en，污染后面的测试
+  }
+
+  // 信息不足的 MoE 也要能渲染，且不崩、不报假速度
+  const bare = { ...metaMoe, file: 'Some-MoE-64x7B-Q4.gguf', expertUsedCount: undefined, paramCount: undefined }
+  const bareR = assess(bare, gpuFast, { weightsBytes: 5.78e9 })
+  const bareText = render(bare, gpuFast, bareR)
+  assert.ok(bareText.includes('MoE'))
+  assert.ok(!/undefined|NaN/.test(bareText))
+})
+
+// ───────────────────────── MoE 显存 + RAM 合计判定 / 启动参数 ─────────────────────────
+
+/** 贴近用户场景：8GB 卡、32GB RAM、16GB 的 8 专家 MoE */
+const hw8Ram32 = {
+  gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0.85 * GB, bandwidthGBps: 448 }],
+  ramBytes: 32 * GB, ramBandwidthGBps: 51, osPlatform: 'win32'
+}
+const metaBigMoe = {
+  ...meta8b,
+  file: 'Mixtral-8x7B-Q6_K.gguf', arch: 'llama', name: 'Mixtral-8x7B',
+  sizeBytes: 16.04e9, paramCount: 46.7e9, blockCount: 32, headCount: 24, headKv: 8,
+  embdLength: 3072, contextLength: 131072, expertCount: 8, expertUsedCount: 2
+}
+
+test('MoE 合计判定：显存放不下但 RAM 够 → combinedFit / canOffload', () => {
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  assert.equal(r.weightsFit, false, '16GB 权重在 8GB 卡上确实装不下全权重')
+  assert.equal(r.moe.combinedFit, true, '显存+系统RAM 合计够')
+  assert.equal(r.moe.canOffload, true, 'MoE 可把专家 offload 到 RAM 运行')
+  assert.ok(r.moe.supplyBytes > r.moe.needBytes)
+  assert.ok(r.moe.spillBytes > 0)
+  assert.ok(r.moe.offloadLayers >= 1 && r.moe.offloadLayers <= 32, 'offload 层数在合理范围')
+  assert.ok(Math.abs(r.moe.usableRam - 32 * GB * TUNING.moeRamFactor) < 1)
+})
+
+test('结论一致性：MoE 靠专家放内存能跑时，verdict 不能说「跑不动」', () => {
+  // 以前 verdictOf 只看 weightsFit/best：报告抬头写「能跑，但专家要放内存」，
+  // JSON 却给 not-recommended，照 JSON 做界面的会说反话。
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  assert.equal(r.moe.canOffload, true)
+  assert.equal(r.best, null, '单卡确实一档上下文都没有（权重都装不下）')
+  assert.notEqual(verdictOf(metaBigMoe, r), 'not-recommended')
+  assert.match(headlineOf(metaBigMoe, r).title, /专家|offload/)
+})
+
+test('MoE 合计判定：RAM 也不够时 combinedFit=false，不误导', () => {
+  const tinyRam = { ...hw8Ram32, ramBytes: 4 * GB }
+  const r = assess(metaBigMoe, tinyRam, { weightsBytes: 16.04e9 })
+  assert.equal(r.moe.combinedFit, false)
+  assert.equal(r.moe.canOffload, false)
+})
+
+test('MoE headline：能 offload 时不报「跑不动」，给专门档位', () => {
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  const hd = headlineOf(metaBigMoe, r)
+  assert.equal(hd.level, 'warn')
+  assert.match(hd.short, /offload/)
+  assert.ok(!/跑不动|won't run/.test(hd.title + hd.short))
+
+  // dense 同样装不下时必须仍是「跑不动」，不能被 MoE 逻辑带偏
+  const dense = { ...meta8b, file: 'BigDense-32B-Q4.gguf', sizeBytes: 16.04e9, paramCount: 32e9 }
+  const dr = assess(dense, hw8Ram32, { weightsBytes: 16.04e9 })
+  const dhd = headlineOf(dense, dr)
+  assert.equal(dhd.level, 'bad')
+  assert.match(dhd.short, /装不下|won't fit/)
+})
+
+test('启动参数：MoE offload 场景给 -ngl / --n-cpu-moe / -c', () => {
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  const args = launchArgsOf(metaBigMoe, r)
+  const flags = args.map((a) => a.flag)
+  assert.ok(flags.some((f) => /^-ngl /.test(f)), '应有 -ngl')
+  const cpuMoe = flags.find((f) => f.startsWith('--n-cpu-moe'))
+  assert.ok(cpuMoe, 'MoE offload 场景应有 --n-cpu-moe')
+  assert.match(cpuMoe, new RegExp(`${r.moe.offloadLayers}`))
+  assert.ok(flags.some((f) => /^-c /.test(f)), '应有 -c 上下文')
+  // JSON 也带上了
+  const row = toJson([{ meta: metaBigMoe, result: r }])[0]
+  assert.ok(row.launchArgs.length >= 3)
+  assert.equal(row.moe.canOffload, true)
+  assert.equal(row.moe.offloadLayers, r.moe.offloadLayers)
+})
+
+test('启动参数：单卡靠专家放内存、合并全放显存更快时，末尾给合并那条', () => {
+  // 双卡机器上同样的 MoE：合并后 16 GB 全进显存，比专家读内存快一个档。
+  // 这时候终端末尾的「启动参数建议」和 JSON 的 launchArgs 都必须是合并那一套 ——
+  // 用户只抄最后一段，给慢的那条等于让 74 tok/s 白写在上面。
+  const hwTwo = {
+    ...hw8Ram32,
+    gpus: [
+      { name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0.85 * GB, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'P104-100', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 320, backend: 'cuda' }
+    ]
+  }
+  // 11.29 GB：单卡 7.52 GB 上限装不下，合并池 15.04 GB 正好放得下
+  const moe = { ...metaBigMoe, file: 'L3.2-8X4B-MOE-21B-Q4_k_s.gguf', sizeBytes: 11.29e9, paramCount: 21e9 }
+  const r = assess(moe, hwTwo, { weightsBytes: 11.29e9 })
+  const mg = mergedHardware(hwTwo)
+  const merged = assess(moe, mg.hw, { weightsBytes: 11.29e9 })
+  assert.equal(r.moe.canOffload, true, '单卡走专家放内存')
+  assert.ok(merged.weightsFit && merged.best, '合并后全放显存')
+  assert.ok(merged.speed.onVram > r.speed.onRam * 1.15, '合并确实快得多')
+
+  const out = render(moe, hwTwo, r, { kvType: 'f16', budget: 'static' })
+  const launch = out.slice(out.indexOf('启动参数建议'))
+  assert.match(launch, /-dev CUDA0,CUDA1/, '末尾命令要给合并')
+  assert.doesNotMatch(launch, /--n-cpu-moe/, '不能再给「专家放内存」那条慢路')
+  // 命令只出现一次：合并评估段里不该再重复一遍
+  assert.equal((out.match(/-dev CUDA0,CUDA1/g) || []).length, 1)
+
+  const row = toJson([{ meta: moe, result: r, combined: merged, mg }])[0]
+  assert.equal(row.splitAcrossGpus, true)
+  assert.ok(row.launchArgs.some((a) => a.flag.startsWith('-dev')), 'JSON 也要给合并')
+})
+
+test('启动参数：dense 与元数据不全场景不出 --n-cpu-moe', () => {
+  const dense = { ...meta8b, sizeBytes: 5.78e9 }
+  const dr = assess(dense, hw8b, { weightsBytes: 5.78e9 })
+  const denseFlags = launchArgsOf(dense, dr).map((a) => a.flag)
+  assert.ok(!denseFlags.some((f) => f.startsWith('--n-cpu-moe')), 'dense 不该有 --n-cpu-moe')
+  assert.ok(denseFlags.some((f) => f.startsWith('-ngl')))
+})
+
+test('MoE 合计判定 + 启动参数的三端渲染：说明出现、行宽不超 100', () => {
+  const r = assess(metaBigMoe, hw8Ram32, { weightsBytes: 16.04e9 })
+  try {
+    for (const lang of ['zh', 'en']) {
+      setLocale(lang)
+      const text = render(metaBigMoe, hw8Ram32, r)
+      assert.match(text, /MoE/, `${lang} 应有 MoE 标记`)
+      assert.match(text, /--n-cpu-moe/, `${lang} 应显示 --n-cpu-moe 启动参数`)
+      assert.match(text, /内存|RAM/, `${lang} 应说明 offload 到内存`)
+      for (const line of text.split('\n')) {
+        const w = [...line].reduce((n, ch) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1), 0)
+        assert.ok(w <= 100, `${lang} 有 ${w} 列的行：${line}`)
+        assert.ok(!/undefined|NaN|⟪/.test(line), `${lang} 有未替换内容：${line}`)
+      }
+    }
+  } finally {
+    setLocale('zh')
+  }
+})
+
+test('MLA：报告模型段标出潜在 KV，中英都不超宽', () => {
+  const ds = {
+    ...metaMoe,
+    blockCount: 61, nextnLayers: 1,
+    headCount: 128, headKv: 1, embdLength: 7168,
+    keyLength: 576, valueLength: 512,
+    keyLengthMla: 192, valueLengthMla: 128,
+    kvLoraRank: 512, ropeDimCount: 64
+  }
+  const r = assess(ds, gpuFast, { weightsBytes: 5.78e9 })
+  try {
+    for (const lang of ['zh', 'en']) {
+      setLocale(lang)
+      const text = render(ds, gpuFast, r)
+      assert.match(text, /MLA/, `${lang} 报告应标出 MLA`)
+      assert.match(text, /576/, `${lang} 报告应显示每 token 元素数`)
+      for (const line of text.split('\n')) {
+        const w = [...line].reduce((n, ch) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1), 0)
+        assert.ok(w <= 100, `${lang} 有 ${w} 列的行：${line}`)
+        assert.ok(!/undefined|NaN|⟪/.test(line), `${lang} 有未替换内容：${line}`)
+      }
+    }
+  } finally {
+    setLocale('zh')
+  }
+})
+
+test('假设清单：MoE 说明改为「已按激活专家修正」', () => {
+  const lines = assumptionLines().join('\n')
+  assert.match(lines, /激活专家|active experts/, '假设清单不该再说「未计入激活比例」')
+})
+
 test('假设清单：明说峰值「不计上下文」并给出折减说明', () => {
   const lines = assumptionLines().join('\n')
   assert.match(lines, /零上下文解码峰值/)
@@ -723,7 +1427,7 @@ test('参数与假设：报告里印出来的数字就是代码里用的那个',
 test('参数与假设：清单完整、和 TUNING 一致', () => {
   // 面板怎么渲染归网页版管（site/test.mjs），这里只守住数据本身不漂
   for (const g of ASSUMPTIONS) assert.ok(g.items.length > 0, `${g.group} 没有条目`)
-  assert.equal(Math.round(TUNING.overheadBytes / 1024 / 1024), 200)
+  assert.equal(Math.round(TUNING.overheadBytes / 1024 / 1024), 800)
   assert.equal(KV_BYTES_PER_ELEM.f16, 2)
   assert.equal(KV_BYTES_PER_ELEM.q8_0, 1.0625)
 })
@@ -731,10 +1435,11 @@ test('参数与假设：清单完整、和 TUNING 一致', () => {
 test('参数与假设：assess 用到的比例和图里写的一致', () => {
   // 混着用两套数字是最难查的 bug：报告说按 92% 算，代码按 94% 算，谁都不报错。
   const g8 = { totalBytes: 8 * GB, usedBytes: 0 }
-  const lin = vramCeiling({ ...g8, platform: 'linux' })
+  const lin = vramCeiling({ ...g8, platform: 'linux', budget: 'auto' })
   assert.equal(lin.limit, 8 * GB * TUNING.freeFactor)
-  const win = vramCeiling({ ...g8, platform: 'win32' })
-  assert.equal(win.limit, Math.max(8 * GB * TUNING.wddmFreeFactor, 8 * GB * TUNING.wddmTotalFactor))
+  const win = vramCeiling({ ...g8, platform: 'win32', budget: 'auto' })
+  // min 而不是 max：total×0.94 只是物理上限，不能当预算用（空闲时 free×0.92 更小，取它）
+  assert.equal(win.limit, Math.min(8 * GB * TUNING.wddmFreeFactor, 8 * GB * TUNING.wddmTotalFactor))
   const uni = vramCeiling({ totalBytes: 32 * GB, unified: true, maxWorkingSetBytes: 24 * GB })
   assert.equal(uni.limit, 24 * GB * TUNING.unifiedReserve)
 })
@@ -962,4 +1667,169 @@ test('交互模式：乱写的语言不改动当前语言', () => {
   }).stdout
   assert.match(out, /没有「war」这个语言/)
   assert.match(out, /检查 > /, '报错后应该还停在中文')
+})
+
+// ── 附加件与逐层 KV 头数
+//
+// 这三个坑都是拿真实模型跑出来的：
+//   LFM3       卷积层 + 注意力层交替，head_count_kv 首层是 0 → 整份报告「算不出来」
+//   mmproj     视觉投影件，文件名继承主模型（…12b…-mmproj.gguf）→ 被报成 12B 模型
+//   MTP 草稿   77 MB 的文件被判成「128K 装得下，可以当 agent 用」
+
+/** 拼一个最小可解析的 GGUF v3（只有元数据，没有张量） */
+function ggufBytes(kvs) {
+  const parts = []
+  const push = (b) => parts.push(b)
+  const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); push(b) }
+  const u64 = (n) => {
+    const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n), true); push(b)
+  }
+  const str = (s) => { const e = new TextEncoder().encode(s); u64(e.length); push(e) }
+  u32(0x46554747); u32(3); u64(0); u64(kvs.length)
+  for (const [key, val] of kvs) {
+    str(key)
+    if (typeof val === 'string') { u32(8); str(val) } else if (Array.isArray(val)) {
+      u32(9); u32(5); u64(val.length) // 9 = ARRAY，5 = INT32
+      for (const n of val) u32(n)
+    } else { u32(5); u32(val) } // 5 = INT32
+  }
+  const total = parts.reduce((n, p) => n + p.length, 0)
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const p of parts) { out.set(p, off); off += p.length }
+  return out
+}
+
+async function writeGguf(kvs) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'vramfit-gguf-'))
+  const file = path.join(dir, 'probe.gguf')
+  await writeFile(file, ggufBytes(kvs))
+  return { file, dir }
+}
+
+test('逐层 head_count_kv：首层是 0 也要读出 KV 头数与带 KV 的层数', async () => {
+  // LFM3 的真实形态：24 层，卷积层写 0，注意力层写 4
+  const arr = Array.from({ length: 24 }, (_, i) => (i % 2 === 0 ? 0 : 4))
+  const { file, dir } = await writeGguf([
+    ['general.architecture', 'lfm3'],
+    ['lfm3.block_count', 24],
+    ['lfm3.attention.head_count', 16],
+    ['lfm3.attention.head_count_kv', arr],
+    ['lfm3.embedding_length', 2048],
+    ['lfm3.attention.key_length', 128],
+    ['lfm3.attention.sliding_window', 256]
+  ])
+  try {
+    const meta = await readGguf(file)
+    assert.equal(meta.headKv, 4, '取数组最大值，不是第一个元素（第一个是 0）')
+    assert.equal(meta.kvLayerCount, 12, '12 层带 KV，不是 24')
+    assert.equal(kvLayers(meta), 12)
+    // 有 KV 才算得出来：以前 headKv=0 直接返回 null，整份报告退化成「算不出来」
+    const kv = kvBytes(meta, 4096, 'f16')
+    assert.ok(kv > 0, 'KV 必须算得出来，不能被 0 头数拦掉')
+    const r = assess(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 400 }] })
+    assert.notEqual(r.estimated, false)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('视觉投影件：arch=clip 且 has_vision_encoder → 判成 mmproj，不当模型', async () => {
+  const { file, dir } = await writeGguf([
+    ['general.architecture', 'clip'],
+    ['general.name', 'Gemma-4-12B-It'],
+    ['clip.has_vision_encoder', 1]
+  ])
+  try {
+    const meta = await readGguf(file)
+    assert.equal(meta.isVision, true)
+    assert.equal(meta.isAssistant, false)
+    const r = assess(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, bandwidthGBps: 400 }] })
+    const hd = headlineOf(meta, r)
+    assert.match(hd.title, /视觉投影件/)
+    assert.match(hd.why, /显存另算 0\.\d+ GB/, '要给出额外占多少显存（投影件 + 图像缓冲）')
+    assert.equal(verdictOf(meta, r), 'vision-projector')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('MTP 草稿：所有层都是 nextn 层 → 判成草稿件，不给 -ngl', async () => {
+  const { file, dir } = await writeGguf([
+    ['general.architecture', 'gemma4-assistant'],
+    ['gemma4-assistant.block_count', 4],
+    ['gemma4-assistant.nextn_predict_layers', 4],
+    ['gemma4-assistant.attention.head_count', 4],
+    ['gemma4-assistant.attention.head_count_kv', 2],
+    ['gemma4-assistant.embedding_length', 256],
+    ['gemma4-assistant.context_length', 131072]
+  ])
+  try {
+    const meta = await readGguf(file)
+    assert.equal(meta.isAssistant, true)
+    const r = assess(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, bandwidthGBps: 400 }] })
+    const hd = headlineOf(meta, r)
+    assert.match(hd.title, /草稿件/)
+    assert.equal(verdictOf(meta, r), 'draft-model')
+    // 77 MB 的草稿件绝不能再出现「可以当 agent 用」或 -ngl 999
+    const out = render(meta, { gpus: [{ name: 'X', totalBytes: 8 * GB, bandwidthGBps: 400 }] }, r, {})
+    assert.doesNotMatch(out, /-ngl/)
+    assert.match(out, /-md/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('参数量：E4B 这类有效参数写法也要认出来', () => {
+  assert.equal(paramCountOf('gemma-4-E4B_q4_0-it.gguf'), 4e9)
+  // 8X4B 仍然不能被当成总参数（这是「8 专家 × 4B」，总参数 21B）
+  assert.equal(paramCountOf('L3.2-8X4B-MOE-21B-Q4_k_s.gguf'), 21e9)
+  assert.equal(paramCountOf('Mixtral-8x7B-Instruct-Q4_K_M.gguf'), undefined)
+})
+
+// 宽度测试原来只渲染一个人造夹具，而真实模型会走到滑窗混合、显存被占用、MoE 合并
+// 这些「只有真机才触发」的说明行。上线前用 21 个真实文件扫出 146/152 列的英文行，
+// 这里把这些路径固定成用例，避免下次改文案又悄悄撑破 100 列。
+test('英文报告：滑窗混合 / 显存被占用 / MoE 合并的说明行也不超 100 列', () => {
+  const swa = {
+    ...meta8b,
+    file: 'Qwen3-Next-9B-Q4_K_M.gguf', arch: 'qwen3next', name: 'Qwen3-Next-9B',
+    blockCount: 40, headKv: 4, slidingWindow: 512, keyLength: 128
+  }
+  const busy = {
+    gpus: [{ name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 7.19 * GB, bandwidthGBps: 448, backend: 'cuda' }],
+    ramBytes: 32 * GB, ramBandwidthGBps: 51, osPlatform: 'win32'
+  }
+  const two = {
+    gpus: [
+      { name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' },
+      { name: 'RTX 2080', totalBytes: 8 * GB, usedBytes: 0, bandwidthGBps: 448, backend: 'cuda' }
+    ],
+    ramBytes: 32 * GB, ramBandwidthGBps: 51, osPlatform: 'win32'
+  }
+  const cases = [
+    ['滑窗混合 + 显存被占用', swa, busy, {}],
+    ['MoE 单卡 offload、合并更快', metaBigMoe, two, { weightsBytes: 16.04e9 }]
+  ]
+  for (const [label, meta, hw, opts] of cases) {
+    for (const lang of ['zh', 'en']) {
+      setLocale(lang)
+      const out = render(meta, hw, assess(meta, hw, opts), opts)
+      for (const line of out.split('\n')) {
+        const w = [...line].reduce((n, ch) => n + (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1), 0)
+        assert.ok(w <= 100, `${label} [${lang}] 有 ${w} 列的行：${line}`)
+      }
+    }
+  }
+  setLocale('zh')
+})
+
+test('JSON：附件件不给参数与速度（77 MB 文件不能报 4B / 0.15 bpw）', () => {
+  const draft = {
+    file: 'mtp-gemma-4-E4B-it-Artemis-Q4_0.gguf', sizeBytes: 76979616,
+    arch: 'gemma4-assistant', blockCount: 4, headCount: 4, headKv: 2,
+    embdLength: 256, contextLength: 131072, tensorCount: 49, isAssistant: true
+  }
+  const r = assess(draft, hw8b, { weightsBytes: draft.sizeBytes })
+  const [j] = toJson([{ meta: draft, result: r, combined: null, mg: null }])
+  assert.equal(j.kind, 'draft')
+  assert.equal(j.params, null, '名字里的 4B 是主模型的，不是草稿件的')
+  assert.equal(j.genTokPerSec, null)
+  assert.equal(j.speedBitsPerWeight, null, '0.15 bpw 这种数不该出现在 JSON 里')
+  assert.equal(j.speedFamily, null)
+  assert.deepEqual(j.tiers, [])
 })

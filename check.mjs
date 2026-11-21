@@ -34,8 +34,8 @@ import {
   quantFromName, shardInfo, totalWeightsBytes, paramCountOf,
   quantRank, quantTier, repoVerdict,
   GB, TUNING, ASSUMPTIONS, KV_BYTES_PER_ELEM, fmtSize, speedCapFor,
-  vramCeiling, attentionInterval, kvLayers, fullLayerFraction, isHybridSwa, kvBytes,
-  analyzeTemplate, assess, attentionReport, verdictOf, headlineOf,
+  vramCeiling, attentionInterval, kvLayers, fullLayerFraction, isHybridSwa, isMla, kvBytes,
+  analyzeTemplate, assess, mergedHardware, attentionReport, verdictOf, headlineOf, launchArgsOf,
   t, setLocale, getLocale, detectLocale, labelWidth, assumptionsList, localeOf
 } from './core/index.mjs'
 
@@ -67,7 +67,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // 版本号写死在这里，由 test.mjs 对着 package.json 校验 —— 单文件 bin 不去读包元数据，
 // 少一次文件系统访问，也避免 npx 缓存目录里包结构变了就崩。
-const VERSION = '1.0.2'
+const VERSION = '1.0.4'
 
 // ───────────────────────────── GGUF 解析 ─────────────────────────────
 
@@ -118,12 +118,42 @@ function bar(ratio, width = 24) {
 
 function render(meta, hw, result, opts = {}) {
   const L = []
-  const { gpu, weights, overhead, freeVram, limit, rows, best, weightsFit } = result
+  const { gpu, weights, overhead, freeVram, limit, rows, best, weightsFit, moe } = result
+  /** 看图开销：主报告的档位不含它，只在预算区单列一行，并给出「带图时建议几 K」 */
+  const vision = opts.extra?.bytes > 0 ? opts.extra : null
+  const visionFit = opts.visionFit ?? null
   const quant = quantFromName(meta.file)
   const ftype = meta.fileType !== undefined ? FILE_TYPE[meta.fileType] : undefined
   const params = paramCountOf(meta.file, meta.paramCount)
   const tpl = analyzeTemplate(meta.chatTemplate)
   const shard = shardInfo(meta.file)
+
+  // 合并评估：多卡机器额外给一份「按层切分、显存合计」的结论。
+  // 提前算是因为抬头结论和启动参数都要用它 —— 单卡放不下时，
+  // 不给用户一句「合起来可以」，他就会去换更小的量化，而其实不用。
+  const mg = mergedHardware(hw)
+  const mergedResult = mg.merged
+    ? assess(meta, mg.hw, {
+      kvType: opts.kvType,
+      weightsBytes: opts.weightsBytes ?? totalWeightsBytes(meta),
+      extraBytes: opts.extra?.bytes ?? 0,
+      budget: opts.budget ?? 'static'
+    })
+    : null
+  /** 合并后是否真的能跑：权重进得去，且至少一档上下文放得下 */
+  const mergedViable = Boolean(mergedResult?.estimated && mergedResult.weightsFit && mergedResult.best)
+  /** 单卡侧是否已经能跑（含 MoE 专家 offload 到内存这种「能跑但要降速」） */
+  const singleViable = Boolean(result.estimated && result.best) || Boolean(result.moe?.canOffload)
+  /**
+   * 单卡只能「专家放内存」时，合并全放显存往往快好几倍（内存 50 GB/s vs 显存 450）。
+   * 这时候报告末尾那条「启动参数建议」必须给合并的那套 —— 用户永远只抄最后一段，
+   * 给他一条 12 tok/s 的命令而 74 tok/s 就写在上面几行，等于白算。
+   */
+  const mergedSpeed = mergedResult?.speed?.onVram
+  const preferMerged = Boolean(
+    mergedViable && result.moe?.canOffload && Number.isFinite(mergedSpeed) &&
+    (!Number.isFinite(result.speed?.onRam) || mergedSpeed > result.speed.onRam * 1.15)
+  )
 
   // ── 版式约定：全报告只有这一套，任何一行都落在栅格上
   //   小节标题   2 空格 + 粗体，前面空一行
@@ -135,7 +165,10 @@ function render(meta, hw, result, opts = {}) {
   // 标签列宽跟着语言走：中文 6 个字 = 12 列，英文单词更长要 14。
   // 写死 12 的话 "Native ctx" 会把值挤到下一列，整张表歪掉。
   const LW = labelWidth()
-  const row = (label, value) => `    ${paint(dpad(label, LW), 'dim')}${value}`
+  // 标签正好占满列宽时 dpad 不会补空格，值会直接贴上去（"部分 offload约 12 tok/s"）。
+  // 宁可这一行多一列，也不能让两个词粘成一个。
+  const row = (label, value) =>
+    `    ${paint(dpad(label, LW) + (dwidth(label) >= LW ? ' ' : ''), 'dim')}${value}`
   const note = (text) => `    ${' '.repeat(LW)}${paint(text, 'dim')}`
   // 块标题（✗ 装不下 / ? 算不出来）下面的说明：只缩一个层级，
   // 不能按值列对齐 —— 那是给「标签—值」用的，套到整段说明上会悬在半空
@@ -164,12 +197,50 @@ function render(meta, hw, result, opts = {}) {
   L.push('')
   L.push(`  ${paint(`${mark} ${hd.title}`, tone, 'bold')}`)
   L.push(`    ${hd.why}`)
+  // 单卡结论说「跑不动」时，多卡机器必须立刻告诉用户「合起来其实可以」，
+  // 否则他会按第一行去换模型或换卡，而机器本来就够。
+  if (mergedViable && !singleViable) {
+    L.push(`    ${paint(t('r.mergedHint', { n: mg.gpus, c: fmtCtx(mergedResult.best.ctx) }), 'cyan', 'bold')}`)
+  } else if (mergedViable && result.moe?.canOffload) {
+    // 专家放内存能跑，但合并后是全显存 —— 后者更快，值得在结论处就指出来
+    L.push(`    ${paint(t('r.mergedHintMoe', { n: mg.gpus, c: fmtCtx(mergedResult.best.ctx) }), 'cyan', 'bold')}`)
+  }
   L.push(`    ${paint(t('r.disclaimer'), 'dim')}`)
+
+  // ── 附加件（视觉投影件 / 推测解码草稿）：不是能独立加载的模型。
+  // 它们没有 KV cache、也没有可评估的上下文档位，硬套主报告的显存/速度段
+  // 只会输出一堆空表和「算不出来」。这里给一份只讲「怎么配、额外占多少」的短报告。
+  if (meta.isVision || meta.isAssistant) {
+    const kind = meta.isVision ? 'vision' : 'draft'
+    const extra = (meta.sizeBytes ?? 0) + (meta.isVision ? TUNING.visionOverheadBytes : 0)
+    section(t('s.model'))
+    L.push(row(t('f.file'), stripControl(path.basename(meta.file))))
+    L.push(row(t('f.size'), `${fmtGB(meta.sizeBytes)}${meta.tensorCount
+      ? paint(t('f.tensors', { n: meta.tensorCount }), 'dim')
+      : ''}`))
+    L.push(row(t('f.kind'), t(`a.${kind}.kind`)))
+    if (meta.arch) L.push(row(t('f.arch'), stripControl(meta.arch)))
+    section(t('s.attach'))
+    if (opts.pair) L.push(row(t('f.pair'), stripControl(opts.pair)))
+    L.push(row(t('f.attachFlag'), cyan(t(`a.${kind}.flag`))))
+    L.push(note(meta.isVision
+      ? t('a.extra.vision', {
+        s: fmtGB(extra), w: fmtGB(meta.sizeBytes), o: fmtGB(TUNING.visionOverheadBytes)
+      })
+      : t('a.extra.draft', { s: fmtGB(extra) })))
+    L.push(note(t(meta.isVision ? 'a.vision.noKv' : 'a.draft.note')))
+    if (!opts.pair) L.push(note(t('a.noPair')))
+    L.push('')
+    return L.join('\n')
+  }
 
   // ── 模型
   section(t('s.model'))
   L.push(row(t('f.file'), stripControl(path.basename(meta.file))))
-  L.push(row(t('f.size'), `${fmtGB(meta.sizeBytes)}${paint(t('f.tensors', { n: meta.tensorCount }), 'dim')}`))
+  // 张量数缺省时不要留下未替换的 {n}（合成/残缺 GGUF 会走到这里）
+  L.push(row(t('f.size'), `${fmtGB(meta.sizeBytes)}${meta.tensorCount
+    ? paint(t('f.tensors', { n: meta.tensorCount }), 'dim')
+    : ''}`))
   if (shard && shard.total > 1) {
     L.push(note(t('f.shard', { i: shard.index, t: shard.total, size: fmtGB(totalWeightsBytes(meta)) })))
   }
@@ -188,30 +259,72 @@ function render(meta, hw, result, opts = {}) {
     shape.push(t('f.layers', { n: meta.blockCount }) + (meta.nextnLayers ? t('f.mtp', { m: meta.nextnLayers }) : ''))
     shape.push(t('f.heads', { h: meta.headCount ?? '?', kv: meta.headKv ?? '?' }))
     if (meta.embdLength) shape.push(t('f.hidden', { n: meta.embdLength }))
-    const gqa = meta.headKv && meta.headCount && meta.headKv < meta.headCount
+    // MLA 也有 head_kv < head_count，但它省显存靠的是潜向量压缩，不是 GQA 分组，
+    // 标成 GQA 会误导（真正的机制由下面单独一行说明）
+    const gqa = !isMla(meta) && meta.headKv && meta.headCount && meta.headKv < meta.headCount
     L.push(row(t('f.structure'), shape.join(dot) + (gqa ? paint(t('f.gqa'), 'dim') : '')))
     const kl = kvLayers(meta)
     const ai = attentionInterval(meta)
     if (kl && kl < realLayers) {
-      const how = ai.inferred
-        ? t('f.mixedInferred', { i: ai.interval })
-        : t('f.mixedExplicit', { i: ai.interval })
       L.push(row(t('f.attention'), t('f.kvLayers', { kl, rl: realLayers })))
-      L.push(note(t('f.mixedNote', { how })))
+      // 两种来源要说清：逐层 head_count_kv 直接给了「哪几层带 KV」（LFM2/3 这类
+      // 卷积与注意力交替的架构），还是按 full_attention_interval 推出来的。
+      // 前者 interval 恒为 1，套「每 1 层 1 层 full attention」会变成一句废话。
+      L.push(note(meta.kvLayerCount
+        ? t('f.mixedPerLayer')
+        : t('f.mixedNote', {
+          how: ai.inferred
+            ? t('f.mixedInferred', { i: ai.interval })
+            : t('f.mixedExplicit', { i: ai.interval })
+        })))
     }
+  }
+  // MLA（DeepSeek V3/R1）：KV 压成潜向量，和同规模 GQA 差一个量级，必须单独说清，
+  // 否则用户会以为这张卡连 32K 都开不了（实际 KV 只有普通公式的 1/2 左右）。
+  if (isMla(meta)) {
+    const kRow = (meta.keyLength ?? 0) > 0
+      ? meta.keyLength
+      : (meta.kvLoraRank ?? 0) + (meta.ropeDimCount ?? 0)
+    L.push(row(t('f.mla'), t('f.mlaDetail', {
+      r: meta.kvLoraRank ?? '?', p: meta.ropeDimCount ?? '?', t: kRow
+    })))
+  }
+  // MoE：专家总数、每 token 激活数（KV 缺字段时显示 ?）、文件名标注的激活参数
+  if (moe) {
+    const detail = t('f.moeExperts', { n: moe.experts, u: moe.used ?? '?' }) +
+      (moe.activeParamsB ? paint(t('f.moeParams', { p: moe.activeParamsB }), 'dim') : '')
+    L.push(row(t('f.moe'), detail))
   }
 
   // ── 硬件
   section(t('s.hw'))
+  // 多卡机器先把所有探测到的卡列出来，再详细展开本次评估针对的那张。
+  // 以前只显示 gpus[0]，用户明明插了两块卡却以为 vramfit 只认出一块。
+  const allGpus = (hw?.gpus ?? []).filter((x) => x && (x.totalBytes ?? 0) > 0)
+  if (allGpus.length > 1) {
+    L.push(row(t('f.gpuCount', { n: allGpus.length }), ''))
+    allGpus.forEach((x, i) => {
+      const tag = t('f.gpuOf', { i: i + 1, n: allGpus.length })
+      const be = { cuda: 'CUDA', rocm: 'ROCm', vulkan: 'Vulkan', metal: 'Metal' }[x.backend] ?? t('f.backendPending')
+      const bw = x.bandwidthGBps ? t('f.bw', { n: x.bandwidthGBps }) : t('f.bwUnknown')
+      const selected = gpu && x.name === gpu.name ? `  ${paint(t('f.current') ?? '←', 'cyan')}` : ''
+      L.push(drow(tag, `${stripControl(x.name)} · ${fmtGB(x.totalBytes)} · ${be} · ${bw}${selected}`))
+    })
+  }
   if (gpu) {
     const backend = { cuda: 'CUDA', rocm: 'ROCm', vulkan: 'Vulkan', metal: 'Metal' }[gpu.backend] ?? t('f.backendPending')
     const bits = [backend]
     if (gpu.driver) bits.push(t('f.driver', { v: gpu.driver }))
     if (gpu.bandwidthGBps) bits.push(t('f.bw', { n: gpu.bandwidthGBps }))
     else bits.push(t('f.bwUnknown'))
-    L.push(row(t('f.gpu'), stripControl(gpu.name)))
-    L.push(note(bits.join(g(' · ', ' | '))))
-
+    if (allGpus.length > 1) {
+      // 上面那张清单已经把卡名、容量、后端、带宽都写过了，
+      // 这里再抄一遍只是噪音 —— 只补清单里没有的驱动版本。
+      if (gpu.driver) L.push(note(t('f.driver', { v: gpu.driver })))
+    } else {
+      L.push(row(t('f.gpu'), stripControl(gpu.name)))
+      L.push(note(bits.join(g(' · ', ' | '))))
+    }
     const used = gpu.usedBytes ?? 0
     const usedRatio = gpu.totalBytes ? used / gpu.totalBytes : 0
     if (gpu.unified) {
@@ -242,12 +355,27 @@ function render(meta, hw, result, opts = {}) {
   L.push(row(t('f.weights'), fmtGB(weights) +
     (shard && shard.total > 1 ? paint(t('f.weightsShard'), 'dim') : '')))
   L.push(row(t('f.overhead'), `${fmtSize(overhead)}${paint(t('f.overheadNote'), 'dim')}`))
+  /**
+   * 看图开销单独一行：它和「运行时开销」不是一回事 —— 不挂投影器就没有这一项，
+   * 但一旦发图片挂上，就是「32K 能跑」和「一发图就 OOM」之间的差。
+   */
+  if (vision) {
+    const vBest = visionFit?.best?.ctx ?? null
+    L.push(row(t('f.vision'), `+${fmtSize(vision.bytes)}` +
+      paint(t('f.visionNote', { f: fmtSize(vision.weights) }), 'dim') +
+      paint(' · ', 'dim') +
+      (vBest
+        ? paint(t('f.visionCtx', { c: fmtCtx(vBest) }), 'yellow')
+        : paint(t('f.visionNoFit'), 'yellow'))))
+  }
   L.push(row(t('f.ceiling'), cyan(fmtGB(limit))))
   const basisNote = {
     wddm: () => (result.reclaimable > 0.3 * GB
       ? t('f.basis.wddmReclaim', { n: fmtGB(result.reclaimable) })
       : t('f.basis.wddm', { p: Math.round((1 - TUNING.wddmTotalFactor) * 100) })),
+    'wddm-unknown': () => t('f.basis.wddmUnknown', { p: Math.round(TUNING.wddmUnknownBudgetFactor * 100) }),
     free: () => t('f.basis.free', { p: Math.round((1 - TUNING.freeFactor) * 100) }),
+    static: () => t('f.basis.static', { p: Math.round(TUNING.wddmTotalFactor * 100) }),
     unified: () => t('f.basis.unified', { p: Math.round((1 - TUNING.unifiedReserve) * 100) }),
     ram: () => t('f.basis.ram', { p: Math.round(TUNING.ramFactor * 100) })
   }[result.limitBasis]
@@ -261,8 +389,14 @@ function render(meta, hw, result, opts = {}) {
   } else if (meta.slidingWindow) {
     L.push(note(t('f.slidingOnly', { w: fmtCtx(meta.slidingWindow) })))
   }
+  /**
+   * 别的程序占着显存时说一句 —— 但静态口径下这句话不能再说成「所以预算变小了」：
+   * 结论明明是按总容量算的，再配一句「被占用了」会让人以为上面的上限已经扣过。
+   * 静态口径下它的含义变成「你并没有独占这张卡，真跑起来会掉速甚至失败」。
+   */
   if (gpu && !gpu.unified && !gpu.shared && (gpu.usedBytes ?? 0) > 1.5 * GB) {
-    L.push(`    ${' '.repeat(LW)}${paint(t('f.usedWarn', { n: fmtGB(gpu.usedBytes) }), 'yellow')}`)
+    const key = result.limitBasis === 'static' ? 'f.usedWarnStatic' : 'f.usedWarn'
+    L.push(`    ${' '.repeat(LW)}${paint(t(key, { n: fmtGB(gpu.usedBytes) }), 'yellow')}`)
   }
 
   if (!result.estimated) {
@@ -276,9 +410,15 @@ function render(meta, hw, result, opts = {}) {
     L.push('')
     L.push(`    ${paint(t('b.noFit'), 'red', 'bold')}`)
     L.push(sub(t('b.noFitLine', {
-      w: fmtGB(weights), o: fmtSize(overhead), sum: cyan(fmtGB(weights + overhead)), limit: cyan(fmtGB(limit))
+      w: fmtGB(weights),
+      o: fmtSize(overhead),
+      sum: cyan(fmtGB(weights + overhead)),
+      limit: cyan(fmtGB(limit))
     })))
-    if (gpu && limit < 1 * GB) {
+    if (moe?.canOffload) {
+      // MoE 能 offload 专家，就不说 dense 那套「慢 3–10 倍」——会吓退用户去换模型
+      L.push(sub(t('b.moeFitsViaOffload')))
+    } else if (gpu && limit < 1 * GB) {
       L.push(sub(t('b.noFitVramFull')))
     } else {
       L.push(sub(result.onCpu
@@ -286,6 +426,23 @@ function render(meta, hw, result, opts = {}) {
         : gpu?.unified
           ? t('b.noFitUnified')
           : t('b.noFitDiscrete')))
+    }
+    // MoE 的关键区别：显存装不下 ≠ 跑不了。专家可 offload 到系统 RAM，
+    // 门槛是显存 + RAM 合计。把这条说明紧跟在「装不下」下面，否则用户会误换模型。
+    if (moe) {
+      L.push('')
+      L.push(sub(paint(moe.combinedFit
+        ? t('b.moeCombinedOk', {
+          ram: fmtGB(moe.usableRam),
+          supply: fmtGB(moe.supplyBytes),
+          need: fmtGB(moe.needBytes),
+          n: moe.offloadLayers
+        })
+        : t('b.moeCombinedBad', {
+          supply: fmtGB(moe.supplyBytes),
+          need: fmtGB(moe.needBytes)
+        }), moe.combinedFit ? 'green' : 'red', 'bold')))
+      L.push(sub(t('b.moeOffloadNote')))
     }
   } else {
     // 表头和数据行同一套列宽：上下文右对齐、体积右对齐 10、进度条 20
@@ -309,8 +466,11 @@ function render(meta, hw, result, opts = {}) {
     }
     L.push('')
     if (best) {
-      L.push(row(t('t.bestCtx'), `${paint(fmtCtx(best.ctx), 'cyan', 'bold')}` +
+      L.push(row(t('t.bestCtx'), `${paint(fmtCtx(best.ctx), best.tight ? 'yellow' : 'cyan', 'bold')}` +
         paint(t('t.bestCtxNote', { need: fmtGB(best.need), limit: fmtGB(limit) }), 'dim')))
+      // 表格里那一行有「△ 接近上限」，但结论行才是用户真正会照抄的数字。
+      // 99% 占用在 8 GB 卡上基本等于「启动就 OOM」，不能只在表格里标个小三角。
+      if (best.tight) L.push(sub(t('t.bestTight')))
       if (meta.contextLength && best.ctx < meta.contextLength) {
         L.push(sub(t('t.canGoHigher', { n: fmtCtx(meta.contextLength) })))
       }
@@ -350,8 +510,11 @@ function render(meta, hw, result, opts = {}) {
   // ── 生成速度
   if (result.speed) {
     const sp = result.speed
-    const gb = weights / 1e9
-    const cap = speedCapFor(weights)
+    // 封顶与公式都用速度口径的权重（MoE = 激活权重），否则显示「÷ 5.78GB」却给出按
+    // 0.18GB 算的速度，用户对不上。basisBytes 由 core 算出，三端共用同一个数。
+    const speedBytes = sp.basisBytes ?? weights
+    const gb = speedBytes / 1e9
+    const cap = speedCapFor(speedBytes)
     section(t('s.speed'))
     const formula = () => note(t('v.formula', { bw: sp.bandwidth, gb: gb.toFixed(2), eff: sp.efficiency }))
     if (sp.cpu) {
@@ -385,10 +548,74 @@ function render(meta, hw, result, opts = {}) {
       L.push(note(t('v.partialNote', { bw: hw.ramBandwidthGBps })))
       L.push(note(t('v.partialNote2', { n: sp.onVram.toFixed(0) })))
     }
-    if (meta.expertCount) {
-      L.push(note(t('v.moe', { n: meta.expertCount })))
+    if (moe) {
+      L.push(note(moe.corrected
+        ? t('v.moe', { n: moe.experts })
+        : t('v.moeUnknown')))
     }
     L.push(note(t('v.bottleneck', { p: TUNING.speedErrorPct })))
+  }
+
+  // ── 合并评估：多卡机器额外给一份「按层切分、显存合计」的结论
+  // 走和主报告完全相同的 assess()，只是硬件换成合并后的虚拟卡，口径绝不分叉。
+  if (mg.merged) {
+    section(t('s.merged'))
+    L.push(row(t('f.mergedPool'), cyan(fmtGB(mg.hw.gpus[0].totalBytes)) +
+      paint(' ' + t('f.mergedCards', { n: mg.gpus }), 'dim')))
+    // 合并后能开多大上下文 —— 这是用户真正想知道的「合起来值不值」
+    if (mergedResult.estimated) {
+      const ok = mergedResult.weightsFit && mergedResult.best
+      const ctxText = ok ? fmtCtx(mergedResult.best.ctx) : ''
+      // 贴着上限（>85%）时别只写「装得下」：碎片、驱动保留量都可能让它加载失败
+      const tight = ok && mergedResult.best.need > mergedResult.limit * TUNING.tightRatio
+      L.push(row(t('f.mergedCtx'), ok
+        ? paint(t(tight ? 'f.mergedCanTight' : 'f.mergedCan', { c: ctxText }), tight ? 'yellow' : 'green', 'bold')
+        : paint(t('f.mergedCant'), 'red', 'bold')))
+      if (tight) L.push(note(t('f.mergedTight')))
+    }
+    // 速度按最弱卡；有一张带宽未知就明说无法可靠估算，不编一个数
+    if (mg.bandwidthUnknown || !mergedResult.speed?.onVram) {
+      L.push(note(t('f.mergedBwUnknown')))
+    } else if (mergedResult.speed.onVram) {
+      const cap = speedCapFor(mergedResult.weights)
+      const v = mergedResult.speed.onVram
+      L.push(row(t('v.allVram'), paint(v > cap
+        ? t('v.under', { n: cap })
+        : t('v.about', { n: v.toFixed(0) }), 'yellow', 'bold')))
+      L.push(note(t('f.mergedBasis', { name: mg.weakestName ?? '?' })))
+    }
+    // MoE 能把专家塞内存时，合并后全放显存通常更快 —— 与其让用户自己拼旗标，
+    // 这里直接给一条能抄的命令。带宽未知时不给速度，但显存/内存的差别是结构性的。
+    // preferMerged 时这一段不写命令：报告末尾的「启动参数建议」就是这一套，
+    // 同一份报告里出现两条一模一样的命令行，用户会以为是两种方案。
+    if (moe?.canOffload && mergedViable && mg.devices?.length && !preferMerged) {
+      L.push(row(t('f.mergedLaunch'),
+        cyan(`-dev ${mg.devices.join(',')} -sm layer -ngl 999 -c ${mergedResult.best.ctx}`)))
+      L.push(note(t('f.mergedFaster')))
+    }
+    L.push(note(t('f.mergedNote')))
+  }
+
+  // ── 启动参数建议：把上面的结论翻译成可照抄的 llama.cpp 旗标。
+  // 单卡一档上下文都放不下、但多卡合起来能跑时，给的是合并的那套旗标 ——
+  // 只报「-ngl 999」会让人以为单卡就能跑，照着抄必然 OOM。
+  const useMerged = mergedViable && (!singleViable || preferMerged)
+  const launchSrc = useMerged ? mergedResult : result
+  const launch = launchArgsOf(meta, launchSrc, {
+    kvType: opts.kvType,
+    merged: useMerged ? { devices: mg.devices } : null
+  })
+  // 单卡、合并都跑不动时不给旗标：给不出能加载的组合，任何旗标都是误导
+  const launchUsable = Boolean(launchSrc.best) || Boolean(launchSrc.moe?.canOffload)
+  if (launch.length && launchUsable) {
+    section(t('s.launch'))
+    // 旗标宽度固定 16（盖住最长的 -ngl / --n-cpu-moe），说明从同一列开始。
+    // 不能拿它当 label 走 row 的 LW=12/14 —— 旗标比标签长，补不齐就会贴在一起。
+    const flagW = 22
+    for (const a of launch) {
+      L.push(`    ${paint(dpad(a.flag, flagW), 'cyan')}${t(a.whyKey, a.args ?? {})}`)
+    }
+    L.push(note(t(useMerged ? (preferMerged ? 'la.noteFaster' : 'la.noteMerged') : 'la.note')))
   }
 
   // ── 参数与假设：结论旁边就写清楚它是怎么算出来的
@@ -400,7 +627,10 @@ function render(meta, hw, result, opts = {}) {
   L.push(drow(t('p.overhead'), t('p.overheadVal', { n: fmtSize(overhead) })))
   L.push(drow(t('p.kv'), t('p.kvVal', { n: KV_BYTES_PER_ELEM[opts.kvType ?? 'f16'] })))
   L.push(drow(t('p.ceiling'), limitBasisText(result.limitBasis)))
-  L.push(drow(t('p.speed'), t('p.speedVal', { e: TUNING.memoryEfficiency, p: TUNING.speedErrorPct })))
+  // 这里必须打印「实际用到的那个效率」，不能再写死 0.7：
+  // 分档后同一份报告可能按 0.60 算，页脚却印 0.7，用户一验算就发现对不上。
+  const effShown = Number(result.speed?.efficiency ?? TUNING.memoryEfficiency)
+  L.push(drow(t('p.speed'), t('p.speedVal', { e: effShown.toFixed(2), p: TUNING.speedErrorPct })))
   L.push(drow(t('p.threshold'), t('p.thresholdVal', {
     r: TUNING.tightRatio, p: fmtNum(TUNING.minAgentParams), c: fmtCtx(TUNING.minAgentContext)
   })))
@@ -413,7 +643,9 @@ function render(meta, hw, result, opts = {}) {
 /** 一行说明显存上限用的是哪套规则，报告和 --about 共用 */
 function limitBasisText(basis) {
   if (basis === 'wddm') return t('lb.wddm', { f: TUNING.wddmFreeFactor, t: TUNING.wddmTotalFactor })
+  if (basis === 'wddm-unknown') return t('lb.wddmUnknown', { f: TUNING.wddmUnknownBudgetFactor })
   if (basis === 'free') return t('lb.free', { f: TUNING.freeFactor })
+  if (basis === 'static') return t('lb.static', { t: TUNING.wddmTotalFactor })
   if (basis === 'unified') return t('lb.unified', { r: TUNING.unifiedReserve })
   if (basis === 'ram') return t('lb.ram', { r: TUNING.ramFactor })
   return t('lb.other')
@@ -444,6 +676,8 @@ ${opt('--ascii', 'u.optAscii')}
 ${opt('--kv <type>', 'u.optKv')}
 ${opt('--vram 8', 'u.optVram')}
 ${opt('--gpu 1', 'u.optGpu')}
+${opt('--budget static', 'u.optBudget')}
+${opt('--mmproj <file>', 'u.optMmproj')}
 ${opt('--mirror <url>', 'u.optMirror')}
 ${opt('--lang zh|en', 'u.optLang')}
 ${opt('--about', 'u.optAbout')}
@@ -699,7 +933,7 @@ async function expandTargets(raw, opts = {}) {
 }
 
 /** 整仓库对比：远程读每个量化的元数据，出一张「该下哪个」的表 */
-async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardware() } = {}) {
+async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardware(), budget = 'static' } = {}) {
   const { urls, sharded } = await listRepoGgufs(repo)
   if (!jsonOut) console.error(paint(`  ${t('x.repoCount', { repo, n: urls.length })}`, 'dim'))
 
@@ -713,7 +947,7 @@ async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardwar
       const meta = await readGguf(url)
       // 分片模型按「第 1 片 × 片数」估算整体权重，否则一个 20 GB 的模型会被当成 4 GB
       const totalWeights = totalWeightsBytes(meta)
-      const result = assess(meta, hw, { kvType, weightsBytes: totalWeights })
+      const result = assess(meta, hw, { kvType, weightsBytes: totalWeights, budget })
       const tpl = analyzeTemplate(meta.chatTemplate)
       const q = quantTier(quant)
       return {
@@ -763,9 +997,70 @@ async function runRepo(repo, { jsonOut = false, kvType = 'f16', hw = makeHardwar
   return rows
 }
 
+/**
+ * 视觉投影器给预算带来的额外占用。
+ *
+ * 投影器权重按文件字节数算，激活按 assumptions 里的固定值算 —— 两者性质不同：
+ * 权重随量化变化，激活只跟分辨率和 batch 有关。返回 0 表示这次按纯文本算。
+ */
+async function visionExtra(mmproj, { jsonOut = false } = {}) {
+  const none = { bytes: 0, weights: 0, overhead: 0 }
+  if (!mmproj) return none
+  if (isUrlLike(mmproj)) return none
+  try {
+    const st = await fs.stat(path.resolve(mmproj))
+    if (!st.isFile() || st.size <= 0) throw new Error('empty')
+    return {
+      bytes: st.size + TUNING.visionOverheadBytes,
+      weights: st.size,
+      overhead: TUNING.visionOverheadBytes
+    }
+  } catch {
+    // 投影器读不到就退回纯文本口径，但必须说一声：静默忽略等于高估可用显存
+    if (!jsonOut) console.error(paint(`  ${t('in.p.mmprojBad', { v: shortName(mmproj) })}`, 'yellow'))
+    return none
+  }
+}
+
+/**
+ * 给附加件找配对的主模型。
+ *
+ * mmproj 的命名里本来就有主模型名（`xxx-Q4_K_M-mmproj.gguf` 对应 `xxx-Q4_K_M.gguf`），
+ * 草稿件则是加了前缀（`mtp-xxx.gguf` 对应 `xxx.gguf`）。先按命名直接找，找不到
+ * 再按「前几段共同词干」在目录里扫一遍 —— 命名不规范时也能给出个候选。
+ * 找不到就返回 null，报告里明说「自己挂到实际用的主模型上」，不瞎猜。
+ */
+async function findPair(file) {
+  if (!file || isUrlLike(file)) return null
+  const abs = path.resolve(file)
+  const dir = path.dirname(abs)
+  const base = path.basename(abs)
+  const cands = []
+  if (/-mmproj\.gguf$/i.test(base)) cands.push(base.replace(/-mmproj\.gguf$/i, '.gguf'))
+  if (/^mtp-/i.test(base)) cands.push(base.replace(/^mtp-/i, ''))
+  for (const c of cands) {
+    try {
+      const st = await fs.stat(path.join(dir, c))
+      if (st.isFile()) return c
+    } catch { /* 继续试下一个 */ }
+  }
+  // 词干兜底：`mtp-gemma-4-E4B-it-Artemis-Q4_0.gguf` 的实际主模型叫
+  // `gemma-4-E4B_q4_0-it.gguf`，名字对不上但前 3 段（gemma-4-E4B）一致
+  const stem = base.replace(/^mtp-/i, '').split(/[-_]/).slice(0, 3).join('-')
+  if (stem.length < 6) return null
+  try {
+    const names = await fs.readdir(dir)
+    const hit = names.filter((n) => /\.gguf$/i.test(n) && n !== base &&
+      !/mmproj/i.test(n) && n.toLowerCase().replace(/[-_]/g, '-').startsWith(stem.toLowerCase()))
+    if (hit.length === 1) return hit[0]
+  } catch { /* 目录读不到就算了 */ }
+  return null
+}
+
 /** 逐个文件出报告；返回每一项（含失败项），便于上层决定退出码 */
-async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHardware() } = {}) {
+async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHardware(), mmproj = null, budget = 'static' } = {}) {
   const results = []
+  const extra = await visionExtra(mmproj, { jsonOut })
   for (const f of files) {
     const remote = isUrlLike(f)
     const shard = shardInfo(f)
@@ -782,9 +1077,26 @@ async function runChecks(files, { jsonOut = false, kvType = 'f16', hw = makeHard
       const meta = await readGguf(remote ? f : path.resolve(f))
       // 分片模型：单片体积只是整体的 1/N，不折算会把 20 GB 的模型当成 4 GB 说「轻松装下」
       const weightsBytes = totalWeightsBytes(meta)
-      const result = assess(meta, hw, { kvType, weightsBytes })
-      results.push({ meta, result })
-      if (!jsonOut) console.log(render(meta, hw, result, { kvType }))
+      /**
+       * 主报告按**纯文本**算：默认启动不挂投影器，推荐档必须能用在这个状态下。
+       * 带投影器的结论单独算一次（纯算术，几毫秒），给界面解释「发图要降多少」。
+       * 以前是把额外开销直接并进主报告 —— 结果是视觉模型一律被判「装不下任何档」，
+       * 用户以为模型不行，其实只是少了「发图才付的这笔钱」这一层区分。
+       */
+      const result = assess(meta, hw, { kvType, weightsBytes, budget })
+      const visionFit = extra.bytes > 0
+        ? assess(meta, hw, { kvType, weightsBytes, extraBytes: extra.bytes, budget })
+        : null
+      // 多卡合并评估：与主报告同一套 assess()，只是硬件换成合并后的虚拟卡
+      const mg = mergedHardware(hw)
+      const combined = mg.merged
+        ? assess(meta, mg.hw, { kvType, weightsBytes, extraBytes: extra.bytes, budget })
+        : null
+      results.push({ meta, result, extra, visionFit, hw, mg, combined })
+      if (!jsonOut) {
+        const pair = meta.isVision || meta.isAssistant ? await findPair(meta.file) : null
+        console.log(render(meta, hw, result, { kvType, extra, visionFit, budget, weightsBytes, pair }))
+      }
     } catch (err) {
       results.push({ file: f, error: err.message })
       if (!jsonOut) {
@@ -824,16 +1136,39 @@ function toJson(results) {
     const { meta, result } = r
     const shard = shardInfo(meta.file)
     const totalBytes = totalWeightsBytes(meta)
+    // 附加件没有可评估的上下文档位与速度：tiers / genTokPerSec 给 null/[]，
+    // 让消费方按 kind 走另一条分支，而不是把 6 档全 ✓ 的空表渲染出来。
+    const isAttachment = Boolean(meta.isVision || meta.isAssistant)
+    // 和终端报告同一套判断：单卡连一档上下文都装不下、多卡合并能跑时，
+    // JSON 里的 launchArgs 也要给多卡那套，否则脚本拿到的是照抄就 OOM 的旗标。
+    // 单卡只能「专家放内存」而合并全放显存更快时，同样给合并那套 ——
+    // 终端给快的那条、JSON 给慢的那条，是最难查的一类不一致。
+    const mergedSpeed = r.combined?.speed?.onVram
+    const preferMerged = Boolean(
+      r.combined?.estimated && r.combined.weightsFit && r.combined.best &&
+      result.moe?.canOffload && Number.isFinite(mergedSpeed) &&
+      (!Number.isFinite(result.speed?.onRam) || mergedSpeed > result.speed.onRam * 1.15)
+    )
+    const splitAcrossGpus = preferMerged || Boolean(
+      r.combined?.estimated && r.combined.weightsFit && r.combined.best &&
+      !result.best && !result.moe?.canOffload
+    )
+    const launchTarget = splitAcrossGpus ? r.combined : result
     return {
       file: meta.file,
       name: meta.name,
       arch: meta.arch,
+      // 附加件（mmproj / MTP 草稿）不是模型：调用方看到 kind 就该换个界面分支，
+      // 而不是拿 tiers / genTokPerSec 去渲染一张空表。
+      kind: meta.isVision ? 'vision' : meta.isAssistant ? 'draft' : 'model',
       sizeBytes: meta.sizeBytes,
       // 分片模型：sizeBytes 是第 1 片，weightsBytes 才是按片数折算后的整体
       shard: shard ? { index: shard.index, total: shard.total } : null,
       weightsBytes: totalBytes,
       quant: quantFromName(meta.file),
-      params: paramCountOf(meta.file, meta.paramCount) ?? null,
+      // 投影件的文件名继承自主模型（`…12b…-mmproj.gguf`），草稿件同理
+      // （`mtp-gemma-4-E4B…` 只有 77 MB）：从名字里猜 12B / 4B 是纯误导，一律置空。
+      params: isAttachment ? null : paramCountOf(meta.file, meta.paramCount) ?? null,
       layers: meta.blockCount ?? null,
       headCount: meta.headCount ?? null,
       headKv: meta.headKv ?? null,
@@ -845,24 +1180,124 @@ function toJson(results) {
         name: result.gpu.name,
         totalBytes: result.gpu.totalBytes,
         usedBytes: result.gpu.usedBytes ?? 0,
+        /** 已用显存读不到（A 卡 / 核显）：预算已按保守系数算过，界面要能解释 */
+        usedUnknown: result.gpu.usedUnknown === true,
         kind: result.gpu.kind ?? 'discrete',
         unified: Boolean(result.gpu.unified),
         backend: result.gpu.backend ?? null
       } : null,
       cpuOnly: Boolean(result.onCpu),
+      /**
+       * 探测到的全部显卡（多卡机器不再只回一张）。recommendedCtx 等仍是针对 gpu 那张单卡。
+       */
+      gpus: (r.hw?.gpus ?? []).map((x) => ({
+        name: x.name,
+        totalBytes: x.totalBytes,
+        usedBytes: x.usedBytes ?? 0,
+        backend: x.backend ?? null,
+        bandwidthGBps: x.bandwidthGBps ?? null,
+        kind: x.kind ?? 'discrete'
+      })),
+      /** 多卡合并评估；单卡或附加件时为 null。显存池=各卡之和，速度按最弱卡粗估 */
+      combined: !isAttachment && r.mg?.merged ? {
+        cards: r.mg.cards,
+        poolBytes: r.mg.hw.gpus[0].totalBytes,
+        weakest: r.mg.weakestName,
+        bandwidthUnknown: r.mg.bandwidthUnknown,
+        limitBytes: r.combined?.limit ?? null,
+        basis: r.combined?.limitBasis ?? null,
+        recommendedCtx: r.combined?.best?.ctx ?? null,
+        verdict: r.combined ? verdictOf(meta, r.combined) : null,
+        speed: r.combined?.speed?.onVram ?? null
+      } : null,
       budget: { limitBytes: result.limit, basis: result.limitBasis },
-      tiers: result.rows.map((x) => ({ ctx: x.ctx, needBytes: x.need, fits: x.fits })),
-      recommendedCtx: result.best?.ctx ?? null,
+      /**
+       * 看图口径：主报告（tiers / recommendedCtx）按纯文本算，这里给发图片时的结论。
+       * null 表示没传投影器，或这个模型本来就没有投影器。
+       */
+      vision: r.extra?.bytes > 0
+        ? {
+          projectorBytes: r.extra.weights,
+          activationBytes: r.extra.overhead,
+          totalBytes: r.extra.bytes,
+          /** 挂上投影器后还能开的最大档；null = 一档都不行（应退回纯文本或分层） */
+          recommendedCtx: r.visionFit?.best?.ctx ?? null,
+          fits: Boolean(r.visionFit?.best)
+        }
+        : null,
+      /**
+       * tight（need > limit × 0.85）必须一起序列化。
+       *
+       * 以前这里只挑了 ctx / needBytes / fits 三个字段，于是启动链拿不到「这一档贴着
+       * 上限」这个事实 —— 8 GB 卡上 7B 模型算出 64K 占用 6.42 GB、预算 6.45 GB
+       * （ratio 0.994），明明一毫米余量，还是照样推荐、照样按它启动，
+       * 装不下再花 10 秒重载降档。beyondNative 同理，界面要能说明「这档是 RoPE 外推」。
+       */
+      tiers: isAttachment ? [] : result.rows.map((x) => ({
+        ctx: x.ctx,
+        needBytes: x.need,
+        fits: x.fits,
+        tight: x.tight === true,
+        beyondNative: x.beyondNative === true
+      })),
+      recommendedCtx: isAttachment ? null : result.best?.ctx ?? null,
       estimated: result.estimated !== false,
       bandwidth: result.speed?.bandwidth ?? null,
-      // 速度口径见 speedBasis：零上下文、batch=1、全权重驻留显存时的解码峰值
-      genTokPerSec: jsonSpeed(result.speed?.onVram, totalBytes),
-      genTokPerSecOnCpu: jsonSpeed(result.speed?.onRam, totalBytes),
+      // 速度口径见 speedBasis：零上下文、batch=1、权重驻留显存时的解码峰值。
+      // 封顶按速度口径的权重（MoE = 激活权重），与命令行/网页封顶同一个数。
+      genTokPerSec: isAttachment
+        ? null
+        : jsonSpeed(result.speed?.onVram, result.speed?.basisBytes ?? totalBytes),
+      genTokPerSecOnCpu: isAttachment
+        ? null
+        : jsonSpeed(result.speed?.onRam, result.speed?.basisBytes ?? totalBytes),
       // 按建议上下文补上 KV cache 读取代价后的折减值，用来解释峰值与实测的差距
-      genTokPerSecAtCtx: jsonSpeed(result.speed?.atCtx, totalBytes),
+      genTokPerSecAtCtx: isAttachment
+        ? null
+        : jsonSpeed(result.speed?.atCtx, result.speed?.basisBytes ?? totalBytes),
       speedCtx: result.speed?.atCtxTokens ?? null,
       speedBasis: 'zero-context-decode-peak',
-      moe: meta.expertCount ? { experts: meta.expertCount, active: meta.expertUsedCount ?? null } : null,
+      /**
+       * 速度效率来源：family 是被识别的后端族，efficiency 是「带宽利用率 × 反量化惩罚」；
+       * 后端未知时 family='unknown'、efficiency 退回 0.7（2080 实测校准点）。
+       * 让脚本能解释一个数是怎么来的，而不是只拿到一个孤零零的 tok/s。
+       */
+      speedFamily: isAttachment ? null : result.speed?.family ?? null,
+      speedEfficiency: isAttachment ? null : result.speed?.efficiency ?? null,
+      // 位宽是从「体积 ÷ 参数量」反推的，附加件这两项都不可信（0.07 GB / 4B → 0.15 bpw）
+      speedBitsPerWeight: isAttachment ? null : result.speed?.bitsPerWeight ?? null,
+      /**
+       * MoE：速度按激活专家估算，显存仍按全权重。ratio=null 表示拿不到激活数、速度未修正。
+       * source: kv = 元数据 expert_used_count；name = 文件名 A22B 兜底；null = 未修正。
+       */
+      moe: result.moe ? {
+        experts: result.moe.experts,
+        active: result.moe.used,
+        ratio: result.moe.ratio,
+        activeParamsB: result.moe.activeParamsB,
+        speedBasisBytes: result.moe.activeBytes,
+        corrected: result.moe.corrected,
+        source: result.moe.source,
+        /** 显存 + 系统 RAM 合计能否跑下（MoE 专家可 offload 到 RAM） */
+        combinedFit: result.moe.combinedFit,
+        canOffload: result.moe.canOffload,
+        ramBytes: result.moe.ramBytes,
+        usableRam: result.moe.usableRam,
+        supplyBytes: result.moe.supplyBytes,
+        needBytes: result.moe.needBytes,
+        spillBytes: result.moe.spillBytes,
+        offloadLayers: result.moe.offloadLayers
+      } : null,
+      /** llama.cpp 启动旗标建议（结构化，供界面直接拼命令行） */
+      // 附加件给不出「怎么跑主模型」的旗标，空数组比一组误导性的 -ngl 999 好
+      launchArgs: meta.isVision || meta.isAssistant
+        ? []
+        : launchArgsOf(meta, launchTarget, {
+          kvType: r.kvType,
+          merged: splitAcrossGpus ? { devices: r.mg?.devices } : null
+        }),
+      /** 上面那套旗标是不是多卡按层切分（单卡放不下、合并能跑时才为 true） */
+      splitAcrossGpus,
       verdict: verdictOf(meta, result),
       // 这一行故意不跟 --lang 走：JSON 是给脚本消费的，要求同一份输入在任何机器上
       // 产出逐字节相同的结果。跟着系统语言变会让 CI 快照随机失败。
@@ -983,6 +1418,10 @@ export function inputMode({ isTTY, platform }) {
 async function interactive(opts = {}) {
   const kvType = opts.kvType ?? 'f16'
   const gpuIndex = opts.gpuIndex ?? 0
+  /** 只看文字就够，但带上投影器算出来的才是「发图片时」的真实预算 */
+  const mmproj = opts.mmproj ?? null
+  /** 预算口径要一路带到每次检查：交互模式下同一句话可能查好几次，口径不能中间掉回默认 */
+  const budget = opts.budget ?? 'static'
 
   const mode = inputMode({ isTTY: process.stdin.isTTY, platform: process.platform })
   const cooked = mode.cooked
@@ -1086,7 +1525,7 @@ async function interactive(opts = {}) {
         let name = cleanPasted(repoCmd[1])
         const hf = parseHfInput(name)
         if (hf?.kind === 'repo') name = hf.repo
-        await runRepo(name, { kvType, hw })
+        await runRepo(name, { kvType, hw, budget })
         continue
       }
 
@@ -1099,8 +1538,8 @@ async function interactive(opts = {}) {
         console.log(paint(`  ${t('x.unrec3')}`, 'dim'))
         continue
       }
-      for (const r of repos) await runRepo(r, { kvType, hw })
-      if (files.length) await runChecks(files, { kvType, hw })
+      for (const r of repos) await runRepo(r, { kvType, hw, budget })
+      if (files.length) await runChecks(files, { kvType, hw, mmproj, budget })
     } catch (err) {
       console.log(paint(`\n  ✗ ${err.message}`, 'red'))
     }
@@ -1148,7 +1587,7 @@ async function main() {
   if (argv.includes('--about')) { about(); return }
 
   const jsonOut = argv.includes('--json')
-  const { kvType, manualVram, gpuIndex, repo, mirror, problems } = parseOptions(argv)
+  const { kvType, manualVram, gpuIndex, repo, mirror, mmproj, budget, problems } = parseOptions(argv)
   if (problems.length) {
     for (const p of problems) console.error(paint(`  ✗ ${p}`, 'red'))
     console.error(paint(`  ${t('x.helpHint')}`, 'dim'))
@@ -1179,7 +1618,7 @@ async function main() {
     if (raw.length) {
       console.error(paint(`  ${t('x.repoIgnore', { n: raw.length })}`, 'yellow'))
     }
-    const rows = await runRepo(repo, { jsonOut, kvType, hw }) ?? []
+    const rows = await runRepo(repo, { jsonOut, kvType, hw, budget }) ?? []
     // 整个仓库一个都读不到 → 网络问题，CI 里应当失败；只是部分变体失败不算
     if (rows.length && rows.every((r) => r?.error)) process.exitCode = 1
     return
@@ -1189,18 +1628,18 @@ async function main() {
   //    从管道喂链接，三种情况都走这里，粘贴链接永远可用。
   if (!raw.length) {
     if (jsonOut) { usage(); process.exitCode = 1; return }
-    await interactive({ kvType, manualVram, gpuIndex })
+    await interactive({ kvType, manualVram, gpuIndex, mmproj, budget })
     return
   }
 
   const { files, repos } = await expandTargets(raw, { jsonOut, guessRepo: true })
   for (const r of repos) {
-    const rows = await runRepo(r, { jsonOut, kvType, hw }) ?? []
+    const rows = await runRepo(r, { jsonOut, kvType, hw, budget }) ?? []
     if (rows.length && rows.every((x) => x?.error)) process.exitCode = 1
   }
   if (!files.length) return
 
-  const results = await runChecks(files, { jsonOut, kvType, hw })
+  const results = await runChecks(files, { jsonOut, kvType, hw, mmproj, budget })
   if (jsonOut) console.log(JSON.stringify(toJson(results), null, 2))
   // 有文件读不到时退非 0，JSON 模式才好在 CI 里用
   if (results.some((r) => r?.error)) process.exitCode = 1

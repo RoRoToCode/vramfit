@@ -191,10 +191,13 @@ export function stripControl(s) {
 
 // ───────────────────────────── 命令行参数 ─────────────────────────────
 
-export const KV_TYPES = new Set(['f16', 'q8_0', 'q4_0'])
+export const KV_TYPES = new Set(['f16', 'q8_0', 'q4_0', 'k8v16'])
 
-/** 只有这三个选项带值，其余（--json / --no-color）是开关 */
-export const VALUE_FLAGS = new Set(['--kv', '--vram', '--gpu', '--repo', '--mirror', '--lang'])
+/** 只有这几个选项带值，其余（--json / --no-color）是开关 */
+export const VALUE_FLAGS = new Set(['--kv', '--vram', '--gpu', '--repo', '--mirror', '--lang', '--mmproj', '--budget'])
+
+/** 预算口径：auto = 按当前空闲显存；static = 按物理容量（不看当前占用） */
+export const BUDGET_MODES = new Set(['auto', 'static'])
 
 /**
  * 把 --kv=q8_0 / --vram=8 / --repo=a/b 拆成两个参数。
@@ -277,5 +280,35 @@ export function parseOptions(argv) {
     }
   }
 
-  return { kvType, manualVram, gpuIndex, repo, mirror, problems }
+  /**
+   * 视觉投影器：给了就把它的体积和激活开销算进预算。
+   *
+   * 这是「体检说装得下、发图片就崩」的根因：9B 模型带 mmproj 实测多占 680 MiB，
+   * 而体检只算主模型文件。调用方在启动前知道会不会挂投影器，所以由它传进来。
+   * 只做路径存在性检查（体积由 CLI 读），这里不碰文件系统 —— core 要能在浏览器跑。
+   */
+  const mmIdx = argv.indexOf('--mmproj')
+  let mmproj = null
+  if (mmIdx >= 0) {
+    const v = argv[mmIdx + 1]
+    if (!v || v.startsWith('--')) problems.push(t('in.p.mmprojNeeds'))
+    else mmproj = cleanPasted(v)
+  }
+
+  /**
+   * 预算口径。默认 static（按物理容量算，不看当前占用），`auto` 按当前空闲显存算。
+   *
+   * 非法值必须报错而不是静默回落到 static：这直接决定结论是高是低，
+   * 用户写了 `--budget statik` 却拿到一份静态口径的报告，只会更难发现。
+   */
+  const bgIdx = argv.indexOf('--budget')
+  let budget = 'static'
+  if (bgIdx >= 0) {
+    const v = argv[bgIdx + 1]
+    if (!v || v.startsWith('--')) problems.push(t('in.p.budgetNeeds'))
+    else if (!BUDGET_MODES.has(v.toLowerCase())) problems.push(t('in.p.budgetBad', { v }))
+    else budget = v.toLowerCase()
+  }
+
+  return { kvType, manualVram, gpuIndex, repo, mirror, mmproj, budget, problems }
 }

@@ -102,7 +102,8 @@ Recursive scanning matches LM Studio's `models/<publisher>/<repo>/x.gguf` layout
 | `-i, --interactive` | kept for compatibility; no arguments already starts interactive mode |
 | `--kv <type>` | KV cache precision: `f16` (default) / `q8_0` (halves it) / `q4_0` |
 | `--vram 12` | pretend you have 12 GB (keeps GPU name and bandwidth) to price an upgrade |
-| `--gpu N` | evaluate the Nth GPU; required on multi-GPU machines, no tensor parallelism |
+| `--gpu N` | evaluate the Nth GPU (default: the first); multi-GPU machines also get a combined estimate |
+| `--budget static\|auto` | budget basis: `static` (default, total VRAM×0.94, ignores current usage) / `auto` (current free VRAM) |
 | `--mirror <url>` | default `hf-mirror.com`; `https://huggingface.co` goes direct |
 | `--lang zh\|en` | UI language, defaults to the system; `VRAMFIT_LANG` also works |
 | `--no-color` / `--ascii` | colour off / ASCII glyphs, for redirects and old terminals |
@@ -131,22 +132,46 @@ Real output, abridged: RTX 3050 (8 GB) checking a 7B Q4_K_M.
             28 layers · 28 heads / 4 KV heads (GQA)
   Hardware  RTX 3050 · CUDA · bandwidth 224 GB/s
             VRAM 8.00 GB total / 1.15 GB used / 6.85 GB free
-  Budget    weights 4.36 GB + overhead 200 MiB → ceiling 7.52 GB
+  Budget    weights 4.36 GB + overhead 800 MiB → ceiling 7.52 GB
 
   Context      need       of ceiling
-      4K     4.78 GB  █████████████░░░░░░░ ✓
-     32K     6.31 GB  █████████████████░░░ ✓
-     64K     8.06 GB  ████████████████████ ✗
+      4K     5.38 GB  ██████████████░░░░░░ ✓
+     32K     6.91 GB  ███████████████████░ ✓
+     64K     8.66 GB  ████████████████████ ✗
     128K    11.56 GB  ████████████████████ ✗
 
   Recommended  32K (6.31 GB / ceiling 7.52 GB)
      native 128K is supported, VRAM runs out first
   Agent     template 2.5 KB · ✓ tools branch · ✓ tool_call format
             supported at template level; real runs decide reliability
-  Speed     ~33 tok/s (224 GB/s ÷ 4.68 GB × 0.7)
+  Speed     ~29 tok/s (224 GB/s × 0.60 ÷ 4.68 GB)
 ```
 
 The number that matters isn't "it runs" — it's **"native 128K, but this machine tops out at 32K"**. Every report ends with a parameters block; `--about` is the full version.
+
+### Multi-GPU machines
+
+With two cards plugged in, the hardware section lists each card and then adds a **combined estimate**: one model split across the cards by layer (`-sm layer`), VRAM summed, bandwidth taken from the slowest card.
+
+When a model fits the pool but not a single card, the verdict says so up front and the launch flags switch to the multi-GPU set — no hand-assembling:
+
+```
+  ✗ Won't run on this machine
+    Weights fit (6.63 GB), but the smallest tier (4K) needs 8.23 GB in total, above 7.52 GB
+    2 GPUs combined can run it at 32K — see the combined check below
+
+  Combined (multi-GPU, layer split)
+    Combined VRAM pool  16.00 GB 2 cards combined
+    Largest context     32K (fits once combined)
+
+  Suggested launch flags (llama.cpp)
+    -dev CUDA0,CUDA1      GPUs in the merged pool (driver enumeration order)
+    -sm layer             whole layers per GPU, not tensor parallelism
+    -ngl 999              put all layers in VRAM
+    -c 32768              suggested context 32K
+```
+
+This is **layer splitting** (a whole layer lives on one card), not tensor parallelism: the VRAM really is pooled, but the cards take turns on the same token, so throughput doesn't double — hence the speed is quoted from the slowest card. To use the cards separately (one model each), evaluate them one at a time with `--gpu 1`.
 
 ## How the web version relates
 
@@ -178,7 +203,13 @@ One token reads the entire weight set from memory, so the bottleneck is **bandwi
 tok/s ≈ bandwidth(GB/s) × efficiency ÷ weight size(GB)
 ```
 
-Calibrated on an RTX 2080 (448 GB/s) with a 9B Q4_K_M (5.78 GB): `448 × 0.7 ÷ 5.78 = 54.3`, **measured 53.9**. That's where 0.7 comes from. All four tiers were actually loaded with llama.cpp on that machine:
+Efficiency is not a constant: it's tabulated by **backend family × weight bit-width**. At 16-bit only bandwidth utilisation counts; at 4-bit a dequantisation penalty stacks on top, interpolated in between. Bit-width isn't looked up in a table — it's derived from real file size ÷ parameter count, so new quant formats work too.
+
+The historical calibration point is an RTX 2080 (448 GB/s) with a 9B Q4_K_M (5.78 GB): `448 × 0.7 ÷ 5.78 = 54.3`, measured 53.9. The problem with a single point is that 0.7 systematically over-predicts on high-bandwidth cards like the 4090 — across the same four models it ran about 18% high, and per-backend/per-width tabulation brings that to roughly 3%.
+
+The trade-off, stated plainly: on that same 2080 the estimate becomes `448 × 0.60 ÷ 5.78 = 46.5`, about 14% below the measurement. **One measured point cannot cover every card**, so we chose accuracy on newer cards and conservatism on older ones, and widened the band from ±15% to **±20%** (speed only; the VRAM predictions below are unaffected).
+
+All four tiers were actually loaded with llama.cpp on that machine:
 
 | Context | Predicted | Measured VRAM | Error | Measured speed |
 |---|---|---|---|---|
@@ -187,12 +218,12 @@ Calibrated on an RTX 2080 (448 GB/s) with a 9B Q4_K_M (5.78 GB): `448 × 0.7 ÷ 
 | 32K | 6738 MiB | 6676 MiB | +0.9% | 53.9 tok/s |
 | 64K | 7762 MiB | 7737 MiB | +0.3% | 57.1 tok/s |
 
-Predictions run slightly high (conservative), all within 2%. 64K is marked ✗ on purpose: it did load, but with 251 MiB left — one browser tab and you're OOM. It recommends what you can safely use, not the largest thing that barely fits.
+VRAM predictions run slightly high (conservative), all within 2%. 64K is marked ✗ on purpose: it did load, but with 251 MiB left — one browser tab and you're OOM. It recommends what you can safely use, not the largest thing that barely fits.
 
 A few trade-offs:
 
 - **Weights don't fit** → it switches to RAM bandwidth (~60 GB/s), so you'll see `~6 tok/s`. That's what partial offload feels like.
-- **Under 2 GB of weights it only gives a ceiling**: a 0.6B Q4 computes to 395 on a 3050 but measures 70–120. Kernel launches, sampling and transfers dominate; the formula is meaningless there.
+- **Under 2 GB of weights it only gives a ceiling**: a 0.6B Q4 computes to 371 on a 3050 but measures 70–120. Kernel launches, sampling and transfers dominate; the formula is meaningless there.
 - **MoE reads low**: total size is used, but only some experts activate, so real speed is higher. The report says so.
 - **GPUs outside the built-in table get no speed number** rather than a guess.
 
@@ -214,17 +245,29 @@ In one line: **VRAM decides how many tokens of context fit, bandwidth decides ho
 
 | Platform | VRAM from | Ceiling |
 |---|---|---|
-| Windows | `nvidia-smi` / `rocm-smi`, registry fallback | `max(free×0.92, total×0.94)`, WDDM can evict |
-| Linux | `nvidia-smi` / `rocm-smi`, `/sys/class/drm` fallback | free × 0.92, not evictable |
-| macOS | `sysctl hw.memsize`, Metal working set | working set × 0.9 |
+| Windows | `nvidia-smi` / `rocm-smi`, registry fallback | `total×0.94` by default; with `--budget auto`, `min(free×0.92, total×0.94)` |
+| Linux | `nvidia-smi` / `rocm-smi`, `/sys/class/drm` fallback | `total×0.94` by default; `auto` uses `free × 0.92` (not evictable) |
+| macOS | `sysctl hw.memsize`, Metal working set | working set × 0.9 (identical in both modes — unified memory is already capacity-based) |
 | No dGPU | physical RAM | × 0.8, CPU inference |
 
 iGPUs count as half of shared memory and are skipped when a discrete GPU exists. The report states which rule was used.
 
+The default basis is **static** (physical capacity: reproducible, does not swing as other apps open and close),
+at the cost of ignoring current usage; `--budget auto` means "how much is free right now". The free reading has two
+traps: it is a single snapshot, and it is fooled by "released" memory — after another app exits the pages are
+recorded as free but have been scattered by WDDM paging, so throughput does not actually come back.
+
 | Format | Status |
 |---|---|
-| **GGUF** | supported: shards as `first × count`, `mmproj` skipped, quant and template read from metadata |
+| **GGUF** | supported: shards as `first × count`, quant and template read from metadata |
+| **mmproj / MTP draft** | recognised, but never treated as a model: it tells you how to attach it and what VRAM it adds |
 | safetensors / MLX | not supported: a bf16 file isn't what you'd actually run. It says so instead of guessing |
+
+An `mmproj` (vision projector, `arch=clip`) or an `mtp-*.gguf` (speculative-decoding draft,
+`arch=*-assistant`) is not a loadable model. Drop one in and the report says what it is, which
+flag attaches it (`--mmproj` / `-md`), and how much VRAM it costs — instead of turning 0.07 GB
+into a confident "128K fits". If the matching main model sits in the same folder, its name is
+printed in the report.
 
 ## How the numbers are derived
 
@@ -234,11 +277,11 @@ All constants live in [`core/assumptions.mjs`](core/assumptions.mjs) — the rep
 |---|---|
 | Weights | file bytes, shards scaled by count |
 | KV cache | `ctx × layers × n_kv_head × (k+v) × bytes per element`; f16=2 B, q8_0=1.0625 B, q4_0=0.5625 B |
-| Runtime overhead | fixed 200 MiB |
-| Speed | `bandwidth × 0.7 ÷ weightGB`, ±15% |
+| Runtime overhead | fixed 800 MiB (CUDA context + compute buffers) |
+| Speed | `bandwidth × efficiency ÷ weightGB`; efficiency by backend and width, ±20% |
 | Thresholds | need > ceiling×0.85 → "close"; < 3B → runs only; < 8K → too short; 1–2 bit → "avoid" (empirical) |
 
-Hybrid linear attention (Qwen3-Next et al), sliding-window attention (Gemma 3/4), MTP layers, sharding and the native context boundary are handled automatically, and the report distinguishes what was read from what was inferred. One GPU only, no tensor parallelism.
+Hybrid linear attention (Qwen3-Next et al), sliding-window attention (Gemma 3/4), MTP layers, sharding and the native context boundary are handled automatically, and the report distinguishes what was read from what was inferred. Per-GPU results lead; multi-GPU adds a combined check (layer split, VRAM pooled via `-sm layer`, no tensor parallelism).
 
 ## Disclaimer
 
@@ -247,7 +290,7 @@ Hybrid linear attention (Qwen3-Next et al), sliding-window attention (Gemma 3/4)
 So:
 
 - VRAM predictions were calibrated on real hardware (within 2%), but that was four tiers on one RTX 2080. Other platforms and architectures will drift.
-- Speed is estimated from bandwidth, ±15%; small models and large MoE drift further.
+- Speed comes from bandwidth × tabulated efficiency, ±20%; small models and large MoE drift further.
 - `agent-ready` only means "it fits and the template has a tools branch" — **not that the model reliably calls tools**. `unknown` means metadata was incomplete, **not that it won't run**.
 - Results are a reference, not a promise about performance, compatibility or what to buy. The real answer is loading the model once on your machine.
 

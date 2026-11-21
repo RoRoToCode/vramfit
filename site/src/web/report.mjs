@@ -58,12 +58,17 @@ export function buildView(meta, result, ctx = {}) {
   const quant = quantFromName(meta.file) ?? (meta.fileType !== undefined ? FILE_TYPE[meta.fileType] : undefined) ?? tx('rp.unknown')
   const shard = shardInfo(meta.file)
   const weights = totalWeightsBytes(meta)
-  // 和命令行 / JSON 用同一个封顶：小模型上带宽公式会给出跑不出来的数值
+  // 和命令行 / JSON 用同一个封顶：小模型上带宽公式会给出跑不出来的数值。
+  // 封顶权重取速度口径的 basisBytes（MoE = 激活权重），三端口径必须一致。
+  const speedBytes = result.speed?.basisBytes ?? weights
   const speed = result.speed?.onVram
   const sp = Number.isFinite(speed) && speed > 0
-    ? Math.round(Math.min(speed, speedCapFor(weights)))
+    ? Math.round(Math.min(speed, speedCapFor(speedBytes)))
     : null
   const att = attentionReport(meta)
+  // 附加件（mmproj / MTP 草稿）没有解码速度可谈：0.07 GB 的文件按带宽公式
+  // 能算出 200 tok/s，那是纯噪声，用户会当真。
+  const isAttachment = Boolean(meta.isVision || meta.isAssistant)
   const tpl = analyzeTemplate(meta.chatTemplate)
   const bd = breakdown(result)
 
@@ -74,7 +79,8 @@ export function buildView(meta, result, ctx = {}) {
     arch: meta.arch ? clean(meta.arch) : null,
     quant: clean(quant),
     size: fmtGB(weights),
-    params: fmtParams(paramCountOf(meta.file, meta.paramCount)),
+    // 附加件：文件名继承自主模型，从里面猜参数量是纯误导（12B 的投影件其实 0.16 GB）
+    params: meta.isVision ? '—' : fmtParams(paramCountOf(meta.file, meta.paramCount)),
     layers: meta.blockCount ?? null,
     headKv: meta.headKv ?? null,
     native: meta.contextLength ?? null,
@@ -82,11 +88,18 @@ export function buildView(meta, result, ctx = {}) {
     verdict: headlineOf(meta, result),
     bestCtx: result.best?.ctx ?? null,
     bestCtxText: result.best ? fmtCtx(result.best.ctx) : '—',
-    speed: sp,
-    speedOnCpu: Number.isFinite(result.speed?.onRam) && result.speed.onRam > 0
-      ? Math.round(Math.min(result.speed.onRam, speedCapFor(weights)))
-      : null,
-    bandwidth: result.speed?.bandwidth ?? null,
+    speed: isAttachment ? null : sp,
+    speedOnCpu: isAttachment
+      ? null
+      : Number.isFinite(result.speed?.onRam) && result.speed.onRam > 0
+        ? Math.round(Math.min(result.speed.onRam, speedCapFor(speedBytes)))
+        : null,
+    bandwidth: isAttachment ? null : result.speed?.bandwidth ?? null,
+    /** 附加件：界面据此隐藏档位表 / 速度卡，改显示「怎么配」 */
+    kind: meta.isVision ? 'vision' : meta.isAssistant ? 'draft' : 'model',
+    /** 挂上投影件要额外付出的显存（投影器本体 + 图像编码缓冲）；草稿件就是文件本身 */
+    attachBytes: meta.isVision ? (meta.sizeBytes ?? 0) + TUNING.visionOverheadBytes
+      : meta.isAssistant ? (meta.sizeBytes ?? 0) : 0,
     gpuName: result.gpu ? clean(result.gpu.name) : null,
     estimated: result.estimated !== false,
     limit: bd.limit,
@@ -98,7 +111,7 @@ export function buildView(meta, result, ctx = {}) {
     overheadBytes: bd.overhead,
     ratio: bd.ratio,
     onCpu: result.onCpu,
-    tiers: result.rows.map((r) => ({
+    tiers: meta.isVision || meta.isAssistant ? [] : result.rows.map((r) => ({
       ctx: r.ctx,
       ctxText: fmtCtx(r.ctx),
       need: r.need,
@@ -109,14 +122,19 @@ export function buildView(meta, result, ctx = {}) {
       best: result.best?.ctx === r.ctx
     })),
     template: { level: tpl.level, notes: tpl.notes },
+    // MLA：KV 压成潜向量，网页也用同一份 core 解析，字段直接可得
+    mla: att.mla
+      ? { r: att.mla.latentRank ?? '?', p: att.mla.ropeDim ?? '?', t: att.mla.keyRow ?? '?' }
+      : null,
     attention: att.swa
       ? tx('rp.att.swa', { n: att.kvLayers, full: att.swa.fullLayers, win: fmtCtx(att.swa.window) })
       : att.intervalInferred
         ? tx('rp.att.interval', { n: att.kvLayers, i: att.interval })
         : tx('rp.att.plain', { n: att.kvLayers }),
-    moe: meta.expertCount
-      ? tx('rp.moe', { n: meta.expertCount, used: meta.expertUsedCount ?? '?' })
+    moe: result.moe
+      ? tx('rp.moe', { n: result.moe.experts, used: result.moe.used ?? '?' })
       : null,
+    moeCorrected: result.moe?.corrected ?? null,
     kvType: ctx.kvType ?? 'f16'
   }
 }
@@ -162,8 +180,15 @@ export function renderView(v) {
     [tx('rp.info.template'), levelText(v.template.level), read],
     [tx('rp.info.kv'), v.kvType === 'f16' ? tx('rp.info.kvDefault') : v.kvType, tx('rp.src.set')]
   ]
+  if (v.mla) infoRows.push([tx('rp.info.mla'), tx('rp.mla', v.mla), tx('rp.src.read')])
   if (v.moe) infoRows.push([tx('rp.info.moe'), v.moe, read])
   if (v.shard) infoRows.push([tx('rp.info.shard'), tx('rp.info.shardVal', { n: v.shard }), tx('rp.src.derived')])
+
+  // 附加件没有对话模板、也不用选 KV 精度 —— 它们是给主模型用的，留着只会多两行「不支持」
+  if (v.kind && v.kind !== 'model') {
+    const skip = new Set([tx('rp.info.template'), tx('rp.info.kv')])
+    for (let i = infoRows.length - 1; i >= 0; i--) if (skip.has(infoRows[i][0])) infoRows.splice(i, 1)
+  }
 
   const info = infoRows.map(([k, val, src]) =>
     `<div class="kv-row"><span class="k">${esc(k)}</span><span class="v">${esc(val)}</span><span class="src">${esc(src)}</span></div>`
@@ -177,7 +202,7 @@ export function renderView(v) {
 
   // 算不出 KV 时不要画那条进度条：它的分母只有权重，进度条会显示成「几乎占满」，
   // 和「算不出来」的结论自相矛盾。
-  const budget = v.estimated
+  const budgetBar = v.estimated
     ? `<div class="meter"><i style="width:${meter}%"></i></div>
       <div class="b-legend">
         <span><i class="dot w"></i>${tx('rp.legend.weights', { size: fmtGB(v.weightsBytes) })}</span>
@@ -189,6 +214,34 @@ export function renderView(v) {
         <span class="spd">${esc(speedText)}</span></div>
       <p class="note">${tx('rp.note.meta')}</p>`
 
+  const budgetSection = `<section class="budget">
+      <div class="b-head">
+        <span>${tx('rp.budget.title')}</span>
+        <span class="b-num">${esc(v.totalText)} / ${esc(v.limitText)}</span>
+      </div>
+      ${budgetBar}
+      ${v.onCpu ? `<p class="note">${tx('rp.note.onCpu')}</p>` : ''}
+    </section>`
+
+  const tiersSection = `<section class="tiers">
+      <h3>${tx('rp.tiers.title')}</h3>
+      ${tierRows}
+    </section>`
+
+  // 附加件（mmproj / MTP 草稿）：没有档位、没有速度，也没有「装不装得下」。
+  // 硬套主报告的进度条和档位表会显示一张全 ✓ 的空表 + 一个假速度，
+  // 所以整块换成「它是什么、怎么挂到主模型上、额外占多少显存」。
+  const attached = Boolean(v.kind && v.kind !== 'model')
+  const attachSection = attached
+    ? `<section class="attach">
+      <h3>${tx('rp.attach.title')}</h3>
+      <p class="note">${tx(v.kind === 'vision' ? 'rp.attach.vision' : 'rp.attach.draft')}</p>
+      <div class="kv-row"><span class="k">${tx('rp.attach.flag')}</span><span class="v">${esc(tx(v.kind === 'vision' ? 'rp.attach.visionFlag' : 'rp.attach.draftFlag'))}</span></div>
+      <p class="note">${esc(tx('rp.attach.extra', { s: fmtGB(v.attachBytes) }))}</p>
+      <p class="note">${tx('rp.attach.noKv')}</p>
+    </section>`
+    : ''
+
   return `<article class="card">
     <header class="verdict" data-level="${v.verdict.level}">
       <div class="v-main">
@@ -196,8 +249,8 @@ export function renderView(v) {
         <p>${esc(v.verdict.why)}</p>
       </div>
       <div class="v-side">
-        <div class="v-num">${v.bestCtx ? esc(v.bestCtxText) : '—'}</div>
-        <div class="v-cap">${tx('rp.cap.recommended')}</div>
+        <div class="v-num">${attached ? '—' : v.bestCtx ? esc(v.bestCtxText) : '—'}</div>
+        <div class="v-cap">${attached ? esc(tx('rp.attach.flag')) : tx('rp.cap.recommended')}</div>
       </div>
     </header>
 
@@ -210,29 +263,17 @@ export function renderView(v) {
       </div>
     </div>
 
-    <section class="budget">
-      <div class="b-head">
-        <span>${tx('rp.budget.title')}</span>
-        <span class="b-num">${esc(v.totalText)} / ${esc(v.limitText)}</span>
-      </div>
-      ${budget}
-      ${v.onCpu ? `<p class="note">${tx('rp.note.onCpu')}</p>` : ''}
-    </section>
-
-    <section class="tiers">
-      <h3>${tx('rp.tiers.title')}</h3>
-      ${tierRows}
-    </section>
+    ${attached ? attachSection : budgetSection + tiersSection}
 
     <section class="info">
       <h3>${tx('rp.info.title')}</h3>
       ${info}
     </section>
 
-    <details class="tpl">
+    ${attached ? '' : `<details class="tpl">
       <summary>${esc(tx('rp.tpl.summary', { level: levelText(v.template.level) }))}</summary>
       <ul>${tplNotes}</ul>
-    </details>
+    </details>`}
 
     <footer class="disclaimer">
       ${tx('rp.disclaimer', { err: TUNING.speedErrorPct })}
@@ -292,7 +333,7 @@ export function renderRepoTable(repo, rows, hwName) {
  * 「参数与假设」面板。
  *
  * 网页上不写死文案，直接渲染 core/assumptions.mjs 里的清单 ——
- * 和 assess() 用的是同一份常量，改一处三处同步，不会出现「文档说 200 MiB、
+ * 和 assess() 用的是同一份常量，改一处三处同步，不会出现「文档说 800 MiB、
  * 代码算 400 MiB」这种最难查的问题。
  */
 export function renderAssumptions() {

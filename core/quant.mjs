@@ -38,10 +38,22 @@ export function totalWeightsBytes(meta) {
 /** 从文件名猜参数量（B 为单位），仅在没有 general.parameter_count 时用 */
 export function paramsFromName(file) {
   const base = baseName(file).replace(/\.gguf$/i, '')
-  const m = /(?:^|[^a-z0-9])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
-  if (!m) return undefined
-  const n = Number(m[1])
-  return n > 0 && n < 10000 ? n : undefined
+  // 前面必须是「非字母数字」，大写字母也算字母：
+  // `L3.2-8X4B-MOE-...-21B-Q4_K_S` 里的 8X4B 是「8 专家 × 4B」，不是总参数；
+  // 旧写法 [^a-z0-9] 会把 X 当成边界，于是 21B 的模型被报成 4B。
+  const m = /(?:^|[^a-zA-Z0-9])(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
+  if (m) {
+    const n = Number(m[1])
+    if (n > 0 && n < 10000) return n
+  }
+  // Gemma 3n/4 的 `E4B` 写法：E 是「有效参数」（MatFormer 每 token 实际激活的规模），
+  // 前面的 E 是字母，上面那条会被边界挡掉，于是一整类模型都没有参数量。
+  const e = /(?:^|[^a-zA-Z0-9])E(\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
+  if (e) {
+    const n = Number(e[1])
+    if (n > 0 && n < 10000) return n
+  }
+  return undefined
 }
 
 /** 参数量：优先用元数据里的 general.parameter_count，其次从文件名里的「8B」猜 */
@@ -49,6 +61,23 @@ export function paramCountOf(file, explicit) {
   if (typeof explicit === 'number' && explicit > 0) return explicit
   const named = paramsFromName(file)
   return named ? named * 1e9 : undefined
+}
+
+/**
+ * MoE 激活参数（B 为单位）：从文件名的「A22B」写法里取，如
+ * `DeepSeek-R1-235B-A22B-Q4_K_M.gguf` → 22。
+ *
+ * 只认明确带 `A<数字>B` 的名字，不会把 total 的 235B 误当激活。
+ * 这是 GGUF 元数据缺 expert_used_count 时的兜底之一 —— 模型作者常把激活参数
+ * 写进文件名，却不写进 KV 元数据。取不到就返回 undefined，交给上层按专家比例算。
+ */
+export function activeParamsFromName(file) {
+  const base = baseName(file).replace(/\.gguf$/i, '')
+  // A 前要有边界（^ 或非字母数字），避免把 "Qwen3-A..." 之类误判；A 与 B 都是大写惯例，但放宽大小写
+  const m = /(?:^|[^a-z0-9])[aA](\d+(?:\.\d+)?)\s*[bB](?![a-zA-Z0-9])/.exec(base)
+  if (!m) return undefined
+  const n = Number(m[1])
+  return n > 0 && n < 10000 ? n : undefined
 }
 
 export function quantRank(q) {
