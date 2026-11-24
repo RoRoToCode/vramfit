@@ -730,7 +730,7 @@ function about() {
   L.push(paint(`  ${t('ab.foot2')}`, 'dim'))
   L.push('')
   L.push(paint(`  ${t('ab.contact')}`, 'dim'))
-  L.push(paint('  https://github.com/RoRoToCode/vramfit/issues', 'cyan') + paint('  ·  su@roroto.com', 'dim'))
+  L.push(paint('  https://github.com/RoRoToCode/vramfit/issues', 'cyan') + paint('  ·  RoRoToCode@gmail.com', 'dim'))
   L.push('')
   console.log(L.join('\n'))
 }
